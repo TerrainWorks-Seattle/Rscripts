@@ -1,0 +1,1357 @@
+---
+title: "Channel Classification"
+author: "Dan Miller"
+date: today
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: true
+    code-tools: true
+editor: visual
+editor_options: 
+  chunk_output_type: inline
+bibliography: references.bib
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  error = FALSE
+)
+```
+
+```{r}
+#| echo: false
+#| output: false
+#| warning: false
+library(scales)
+library(ggplot2)
+library(dplyr)
+library(terra)
+library(patchwork)
+library(mlr3verse)
+library(data.table)
+library(rms)
+library(Hmisc)
+library(caret)
+library(cutpointr)
+```
+
+# CanFor harvest-block channel surveys
+
+Channel types:
+
+1.  Ephemeral (EPH), little or no channel development
+
+2.  Intermittent (INT), $\le$ 0.4 meters width
+
+3.  Transitional (TRANS), $\gt$ 0.4 to 0.7 meters
+
+4.  Small Permanent (SMPRM), $\gt$ 0.7 to 5.0 meters
+
+5.  Large Permanent (LGPRM), $\gt$ 5.0 meters
+
+Program CanForConflate conflates a synthtic network to the survey reaches and generates a channel-node point shapefile with the requested attributes, included a data field SurvReach that gives the record number of the matched survey reach and SurvType that gives the channel class of the survey reach.
+
+```{r}
+#| code-fold: true
+# nodes holds the entire network
+
+datafile <- "c:/work/data/canfor/areac/nodes_lidar.rds"
+if (!file.exists(datafile)) {
+  file <- "c:/work/data/canfor/areac/class_areac_1.csv"
+  nodes <- data.table::fread(file)
+  nodes <- nodes[GRAD20 >= 0. & LP_1500 >= 0. & AREA_SQKM > 0.]
+  saveRDS(nodes, datafile)
+} else {
+  nodes <- readRDS(datafile)
+}
+
+# survey holds only the survey reaches with a channel-type class
+survey <- nodes[SurvType == "EPH" | SurvType == "INT" | SurvType == "TRANS" | SurvType == "SMPRM" | SurvType == "LGPRM"]
+survey$SurvType <- factor(survey$SurvType, levels = c("EPH", "INT", "TRANS", "SMPRM", "LGPRM"))
+
+```
+
+Here is the list of attributes included in the node-point shapefile:
+
+```{r}
+#| echo: false
+names(survey)
+```
+
+Here are the stream-class labels:
+
+```{r}
+#| echo: false
+unique(survey$SurvType)
+```
+
+The survey reaches are for all channels within harvest cut blocks. How representative of all channels are these surveyed channels? I'll compare some attributes over the entire network to those from the surveyed reaches to see how similar they might be.
+
+Here is contributing area:
+
+```{r}
+#| label: fig-area-dist
+#| fig-cap: "Cumulative distributions for contributing area by proportion of channel length for all channels and for surveyed reaches only"
+
+p1 <- ggplot() +
+  geom_density(data=nodes, aes(x = AREA_SQKM, fill = "All"), alpha = 0.4) +
+  geom_density(data=survey, aes(x = AREA_SQKM, fill = "Survey"), alpha = 0.4) +
+  scale_x_continuous(trans = "log10", labels = label_number()) +
+  coord_cartesian(xlim = c(0.001, 1000.)) + 
+  scale_fill_manual(name = NULL,
+                    values = c(All = "blue", Survey = "red"),
+                    labels = c(All = "Entire Network", Survey = "Survey Reaches"),
+                    limits = c("All", "Survey")) +
+  labs(title = "Node density",
+       subtitle = "Area under curves sum to one",
+       x = "Contributing Area (sq km)",
+       y = "Density") +
+  theme(legend.position = c(.8, 0.93))
+
+
+p2 <- ggplot() +
+      stat_ecdf(data = nodes, aes(x = AREA_SQKM, color = "All"), geom = "step", linewidth = 1.2) +
+      stat_ecdf(data = survey, aes(x = AREA_SQKM, color = "Survey"), geom = "step", linewidth = 1.2) +
+  scale_color_manual(name = NULL,
+                     values = c(All = "blue", Survey = "red"),
+                     labels = c(All = "Entire Network", Survey = "Survey Reaches"),
+                     limits = c("All", "Survey")) +
+  labs(title = "Cumulative Frequency Distribution",
+       x = "Contributing Area (sq km)",
+       y = "Proportion of total length") +
+  coord_cartesian(xlim = c(0.001, 1000.)) +  
+  scale_x_continuous(trans = "log10", labels = label_number()) +
+  theme(legend.position = c(.6,.2))
+
+p1 + p2
+```
+
+Ideally, the surveys would provide a representative sample of the entire network. What we find is that the survey reaches are under-sampling at smaller areas, below \~0.01 km^2^, and at larger areas, above \~0.5 km^2^. The small end probably includes only survey reaches classified as ephemeral and the large end probably only includes survey reaches classified as permanent. We will check this later on.
+
+Here is a density plot, the same as that in the left panel of @fig-area-dist, but without normalization. The plot to the right shows the proportion of total channel length at a given contributing area (x axis) in survey reaches.
+
+```{r}
+#| label: fig-density-by-count
+#| fig-cap: "Node-count density by contributing area for the entire network and surveyed reaches"
+
+p1 <- ggplot() +
+  geom_density(data=nodes, aes(x = AREA_SQKM, y = after_stat(count), fill = "All"), alpha = 0.4) +
+  geom_density(data=survey, aes(x = AREA_SQKM, y = after_stat(count), fill = "Survey"), alpha = 0.4) +
+  coord_cartesian(xlim = c(0.001, 1000.)) +
+  scale_fill_manual(name = NULL,
+                    values = c(All = "blue", Survey = "red"),
+                    labels = c(All = "Entire Network", Survey = "Survey Reaches"),
+                    limits = c("All", "Survey")) +
+  labs(title = "Node-count density",
+       x = "Contributing Area (sq km)",
+       y = "Number of channel nodes") +
+  scale_x_continuous(trans = "log10", 
+                     labels = label_number()) +
+  theme(legend.position = c(.8, 0.95))
+
+n <- nodes[, log10(AREA_SQKM)]
+s <- survey[, log10(AREA_SQKM)]
+
+n <- nodes[, .(AREA_SQKM, SurvReach)]
+nlong <- melt(n, id.vars = "AREA_SQKM",
+                  measure.vars = "SurvReach")
+nlong <- nlong[, value := as.factor(fifelse(value == -9999,0,1))]
+setkey(nlong,AREA_SQKM)
+
+prop <- ggplot(data=nlong, aes(x=AREA_SQKM, y = after_stat(count), fill = value)) + 
+  geom_density(position="fill", alpha = 0.5, show.legend = FALSE) +
+  scale_x_continuous(trans = "log10", labels = label_number()) +
+  scale_fill_manual(name = NULL,
+                    values = c("0" = "lightgrey", "1" = "red"),
+                    labels = c("0" = "Not Surveyed", "1" = "Survey Reaches")) +
+  coord_cartesian(xlim = c(0.001, 1000.), ylim = c(0., 0.03)) +
+  labs(title = "Proportion of network channels\nin survey reaches",
+       x = "Contributing Area (sq km)",
+       y = "Proportion of channel length")
+p1 + prop
+```
+
+The survey reaches are poorly sampling at the small and large ends compared to the entire synthetic network. Does this mean our sample is biased towards those reaches in the middle of the range? Would an unbiased sample include the same proportion of the entire traced network across all contributing areas? I think so; I'd like to have the surveys sampling, say, 10% of all channels at each contributing-area increment. Those narrow spikes represent single survey reaches and clearly indicate a too-small sample at those contributing areas.
+
+Here's another way to consider potential bias. The next plot shows the number of unique reaches sampled within (log10) increments of contributing area on the left. The plot on the right shows the same histogram, but normalized so the maximum value equal one, overlain on the node-count density plot, also normalized to a maximum value of one.
+
+```{r}
+#| label: fig-normalized-density
+#| fig-cap: "Survey-reach count histogram by contributing area"
+
+s <- survey[, .(AREA_SQKM, SurvReach)]
+s <- s[, log10Area := log10(AREA_SQKM)]
+maxval <- max(s[, log10Area])
+minval <- min(s[, log10Area])
+dy <- (maxval - minval) / 75.
+s <- s[, bin := as.integer((log10Area-minval)/dy)]
+cnts <- s[, .(reaches = length(unique(SurvReach))), by = bin]
+cnts <- cnts[, area := 10^(minval + bin*dy)]
+setkey(cnts,bin)
+p1 <-ggplot(data = cnts, aes(x = area, y = reaches)) +
+  geom_col(fill = "blue", color = "black", width = .07, alpha = 0.4) +
+  scale_x_continuous(trans = "log10", labels = label_number()) +
+  labs(title = "Raw reach counts",
+       x = "Contributing Area (sq km)", 
+       y = "Number of unique survey reaches") +
+  coord_cartesian(xlim = c(0.0001, 1000.0))
+
+p2 <- ggplot() +
+  geom_density(data = nodes, aes(x = AREA_SQKM, y = after_stat(after_stat(count) / max(count)), fill = "All"), linewidth = 1.0, alpha = 0.4) +
+  geom_col(data = cnts, aes(x = area, y = reaches/max(cnts$reaches), fill = "Survey"), width = 0.07, alpha = 0.3, color = "black", linewidth = 0.6) +
+  scale_fill_manual(name = NULL,
+                    values = c(All = "blue", Survey = "red"),
+                    labels = c(All = "Entire Network", Survey = "Survey Reaches"),
+                    limits = c("All", "Survey")) +
+  labs(title = "Counts normalized\nto a maximum of one",
+       x = "Contributing Area (sq km)",
+       y = "Proportion of maximum value") +
+  scale_x_continuous(trans = "log10", 
+                     labels = label_number()) +
+  theme(legend.position = c(.8, 0.95)) +
+  coord_cartesian(xlim = c(0.0001, 1000.0))
+
+p1 + p2
+```
+
+The frequency distribution of the number of unique reaches over log increments of contributing area follow the node-count distribution, except that it appears that at contributing areas greater than about 0.03 km^2^ or so, the surveys are under-sampling the network. Also, below \~0.0003km^2^ and above \~ 0.3km^2^ our sample includes only one or two reaches per increment, which is a bit lean. What's a good number of reaches? Not sure, but surely more than one or two.
+
+How do the distributions of other terrain attributes compare between the network and surveys? Here is a look at landscape position, defined as $(z-zmin)/(zmax-zmin)$, where $z$ is elevation of a channel node, $zmax$ is the maximum elevation within a radius of 1500 meters, and $zmin$ is the minimum elevation within a radius of 1500 meters.
+
+```{r}
+#| label: fig-landscape-position
+#| fig-cap: "Frequency distributions by channel length for landscape position. Landscape positions is calculated as (z-zmin)/(zmax-zmin), where z = elevation with zmax and zmin determined over a 1500-m radius."
+
+p1 <- ggplot() +
+  geom_density(data=nodes, aes(x = LP_1500, fill = "All"), alpha = 0.4) +
+  geom_density(data=survey, aes(x = LP_1500, fill = "Survey"), alpha = 0.4) +
+  scale_fill_manual(name = NULL,
+                    values = c(All = "blue", Survey = "red"),
+                    labels = c(All = "Entire Network", Survey = "Survey Reaches"),
+                    limits = c("All", "Survey")) +
+  labs(title = "Node density",
+       subtitle = "Area under curves sum to one",
+       x = "Landscape Position",
+       y = "Density") +
+  theme(legend.position = c(.8, 0.93))
+
+p2 <- ggplot() +
+  stat_ecdf(data = nodes, aes(x = LP_1500, color = "All"), geom = "step", linewidth = 1.2) +
+  stat_ecdf(data = survey, aes(x = LP_1500, color = "Survey"), geom = "step", linewidth = 1.2) +
+  scale_color_manual(name = NULL,
+                     values = c(All = 'blue', Survey = 'red'), 
+                     labels = c(All = "Entire Network", Survey = "Survey Reaches"),
+                     limits = c("All", "Survey")) +
+  theme(legend.position = c(0.75, 0.15)) +
+  labs(title = "Cumulative frequency distribution",
+       x = "Landscape Position",
+       y = "Proportion of channel length")
+p1 + p2
+```
+
+Survey reaches are under-sampling the valley floors. Here is channel gradient:
+
+```{r}
+#| label: fig-dist-gradient
+#| fig-cap: "Frequency distributions of channel gradient for all channels and for survey reaches. Gradient measured over a 20-m radius."
+p1 <- ggplot() +
+  geom_density(data=nodes, aes(x = GRAD20, fill = "All"), alpha = 0.4) +
+  geom_density(data=survey, aes(x = GRAD20, fill = "Survey"), alpha = 0.4) +
+  scale_fill_manual(name = NULL,
+                    values = c(All = "blue", Survey = "red"),
+                    labels = c(All = "Entire Network", Survey = "Survey Reaches"),
+                    limits = c("All", "Survey")) +
+  labs(title = "Node density",
+       subtitle = "Area under curves sum to one",
+       x = "Gradient",
+       y = "Density") +
+  theme(legend.position = c(.6, 0.93)) +
+  coord_cartesian(xlim = c(0.0, 0.5))
+
+p2 <- ggplot() +
+  stat_ecdf(data = nodes, aes(x = GRAD20, color = "All"), geom = "step", linewidth = 1.2) +
+  stat_ecdf(data = survey, aes(x = GRAD20, color = "Survey"), geom = "step", linewidth = 1.2) +
+  scale_color_manual(name = "Channel Gradient",
+                     values = c(All = 'blue', Survey = 'red'), 
+                     labels = c(All = "Entire Basin", Survey = "Survey Reaches"),
+                     limits = c("All", "Survey")) +
+  coord_cartesian(xlim = c(0.0, 0.5)) +
+  theme(legend.position = c(.6, 0.2)) +
+  labs(title = "Cumulative Frequency Distribution",
+       x = "Gradient",
+       y = "Proportion of Channel Length")
+
+p1 + p2
+```
+
+Survey reaches include more steep channel segments than the entire network. Here is mean gradient of the contributing area to each node:
+
+```{r}
+#| label: fig-mean-gradient
+#| fig-cap: "Frequency distributions of mean contributing-area gradient. Gradient measured over a 30-m radius."
+p1 <- ggplot() +
+  geom_density(data=nodes, aes(x = MeanGrad, fill = "All"), alpha = 0.4) +
+  geom_density(data=survey, aes(x = MeanGrad, fill = "Survey"), alpha = 0.4) +
+  scale_fill_manual(name = NULL,
+                    values = c(All = "blue", Survey = "red"),
+                    labels = c(All = "Entire Network", Survey = "Survey Reaches"),
+                    limits = c("All", "Survey")) +
+  labs(title = "Node density",
+       subtitle = "Area under curves sum to one",
+       x = "Mean Gradient of Contributing Area",
+       y = "Density") +
+  theme(legend.position = c(.6, 0.93)) +
+  coord_cartesian(xlim = c(0.0, 0.5))
+
+p2 <- ggplot() +
+  stat_ecdf(data = nodes, aes(x = MeanGrad, color = "All"), geom = "step", size = 1.2) +
+  stat_ecdf(data = survey, aes(x = MeanGrad, color = "Survey"), geom = "step", linewidth = 1.2) +
+  scale_color_manual(values = c(All = 'blue', Survey = 'red'), 
+                     labels = c(All = "Entire Basin", Survey = "Survey Reaches"),
+                     limits = c("All", "Survey")) +
+  coord_cartesian(xlim = c(0.0, 0.5)) + 
+  labs(title = "Cumulative Distribution",
+       x = "Mean Gradient of Contributing Area",
+       y = "Proportion of channel length",
+       color = NULL) +
+  theme(legend.position = c(0.6, 0.3))
+
+p1 + p2
+```
+
+The survey reaches are sampling a slightly steeper portion of the basin.
+
+A look at the survey reaches by channel type. Here are the number of channel nodes assigned to each channel class from the conflation:
+
+```{r}
+#| label: fig-num-nodes
+#| fig-cap: "Number of channel nodes in each survey-reach class."
+p1 <- ggplot(data=survey) + 
+  geom_bar(aes(x=SurvType, y=after_stat(count)),
+           fill = "blue", color = "black", alpha = 0.3) + 
+  labs(x="Channel Class")
+
+p1
+```
+
+Here are distributions of contributing area across channel types:
+
+```{r}
+#| label: fig-Area-Gradient Density
+#| fig-cap: "Contributing Area and Gradient across channel types"
+#| code-fold: true
+#| 
+
+p1 <- ggplot(data = survey, aes(x = AREA_SQKM, fill = SurvType)) + 
+      geom_density(alpha = 0.5) + 
+      coord_cartesian(xlim = c(0.001, 1000.)) +  
+      scale_fill_discrete(breaks = c('EPH', 'INT', 'TRANS', 'SMPRM', 'LGPRM'),
+                          labels = c('Ephemeral', 'Intermittent', 'Transitional',
+                                 'Small Permanent', 'Large Permanent')) +
+      scale_x_continuous(trans = "log10", labels = label_number()) +
+      labs(title = "Node Density",
+          fill = "Channel Class",
+          x = "Contributing Area (sq km)",
+          y = "Density") +
+     theme(legend.position = c(0.25, 0.8))
+
+p2 <- ggplot(data = survey, aes(x = AREA_SQKM, color = SurvType)) +
+      coord_cartesian(xlim = c(0.001, 1000.)) +   
+      scale_x_continuous(trans = "log10", labels = label_number()) +
+      stat_ecdf(geom = "step", linewidth = 1.2, show.legend = FALSE) +
+      scale_color_discrete(breaks = c('EPH', 'INT', 'TRANS', 'SMPRM', 'LGPRM'),
+                          labels = c('Ephemeral', 'Intermittent', 'Transitional',
+                                     'Small Permanent', 'Large Permanent')) +
+      labs(title = "Cumulative Distributions",
+           color = "Channel Class",
+           x = "Contributing Area (sq km)", 
+           y = "Proportion of Channel Length")
+  
+p1 + p2
+```
+
+Compare these to the entire network. In the following figure, I overlay the cumulative distributions of channel length for each survey-reach type on the density plot from the right panel in @fig-density-by-count.
+
+```{r}
+#| label: fig-compare
+#| fig-cap: "Comparison of contributing areas for the proportion of all channels sampled by a survey reach to the frequency distributions of contributing area for each reach class. Large permanent channels are under sampled."
+#n <- nodes[, log10(AREA_SQKM)]
+#s <- survey[, log10(AREA_SQKM)]
+
+#n <- nodes[, .(AREA_SQKM, SurvReach)]
+#nlong <- melt(n, id.vars = "AREA_SQKM",
+#                  measure.vars = "SurvReach")
+#nlong <- nlong[, value := as.factor(fifelse(value == -9999,0,1))]
+#setkey(nlong,AREA_SQKM)
+
+p1 <- ggplot() + 
+  geom_density(data=nlong, aes(x=AREA_SQKM, y = after_stat(count), fill = value), position="fill", alpha = 0.25) +
+  stat_ecdf(data=survey, aes(x = AREA_SQKM, y = after_stat(ecdf*0.03), color = SurvType), linewidth = 1.2) +
+  coord_cartesian(xlim = c(0.001, 1000.), ylim = c(0., 0.03)) +   
+  scale_x_continuous(trans = "log10", labels = label_number()) +
+  scale_y_continuous(name = "Proportion of all channels in a survey reach",
+                     sec.axis = sec_axis(~./0.03, name = "Proportion of survey reach length")) +
+  scale_color_discrete(breaks = c('EPH', 'INT', 'TRANS', 'SMPRM', 'LGPRM'),
+                          labels = c('Ephemeral', 'Intermittent', 'Transitional',
+                                     'Small Permanent', 'Large Permanent')) +
+  scale_fill_manual(name = NULL,
+                    values = c("0" = "white", "1" = "red"),
+                    labels = c("0" = "Not Surveyed", "1" = "Surveyed")) +
+  labs(color = "Channel Class", x = "Contributing Area (sq km)") +
+  theme(legend.key = element_rect(fill = "transparent"), legend.background = element_rect(fill = "transparent"), legend.position = c(0.11, .78))
+
+p1
+```
+
+The ephemeral, intermittent, and transitional survey reaches occupy a portion of the channel network that is uniformly sampled (2% to 3% of the total channel length for contributing areas associated with those channel classes), whereas the permanent channels occupy a portion of the channel network that is poorly sampled. The spikes in the density plot showing the proportion of all channels in the survey reaches align with single reaches for these classes. A model will be able to distinguish channel proportions in each channel class over any increment of contributing area, but at larger contributing areas (\> 1 km^2^), the results will be biased towards small permanent because large permanent channels are under sampled.
+
+Looking just at the survey reaches:
+
+```{r}
+#| label: fig-box-area
+#| fig-cap: "Box plots of contributing area for all channel nodes in each surveyed reach type."
+p1 = ggplot(data = survey, aes(x = SurvType, y = AREA_SQKM, fill = SurvType)) +
+  geom_boxplot() +
+  coord_cartesian(ylim = c(0.001, 1000.)) +  
+  scale_y_continuous(trans = "log10", labels = label_number()) +  
+  scale_fill_discrete("Channel Type",
+                      breaks = c('EPH', 'INT', 'TRANS', 'SMPRM', 'LGPRM'),
+                               labels = c('Ephemeral', 'Intermittent', 'Transitional','Small Permanent', 'Large Permanent')) +
+  labs(x = "Channel Type", y = "Area (sq km)")
+
+p1
+```
+
+There is separation between all classes, though with a lot of overlap for ephemeral, intermittent, and transitional channels. Note the large shift for large permanent, a consequence of our small sample for this channel type.
+
+Here is another way to look at our sample of the channel network:
+
+```{r}
+#| label: fig-proportions
+#| fig-cap: "Proportion of surveyed channel length in each reach class by contributing area."
+s <- survey[, .(AREA_SQKM, SurvType)]
+s$SurvType <- factor(s$SurvType, levels = c("EPH", "INT", "TRANS", "SMPRM", "LGPRM"))
+slong <- melt(s, id.vars = "AREA_SQKM", measure.vars = "SurvType")
+# Rename the channel types so they plot in correct alphabetical order
+slong <- slong[, value := fifelse(value == "EPH", "A_EPH",fifelse(value == "INT", "B_INT", fifelse(value == "TRANS", "C_TRANS", fifelse(value == "SMPRM", "D_SMPRM", "E_LGPRM"))))]
+setkey(slong,AREA_SQKM)
+
+p3 <- ggplot(data=slong, aes(x=AREA_SQKM, y = after_stat(count), fill = value)) + 
+  geom_density(position="fill", alpha = 0.5) +
+  coord_cartesian(xlim = c(0.001, 1000.)) +
+  scale_x_continuous(trans = "log10", labels = label_number()) +
+  scale_fill_manual(name = NULL,
+                    values = c("A_EPH" = "red", "B_INT" = "green", "C_TRANS" = "purple", "D_SMPRM" = "lightblue", "E_LGPRM" = "darkblue"),
+                    labels = c("A_EPH" = "Ephemeral", "B_INT" = "Intermittent", "C_TRANS" = "Transitional", "D_SMPRM" = "Small Permanent", "E_LGPRM" = "Large Permanent"),
+                    limits = c("A_EPH", "B_INT", "C_TRANS", "D_SMPRM", "E_LGPRM")) +
+  labs(title = "Proportion of survey reaches in each channel class as a function of contributing area",
+       x = "Contributing Area (sq km)",
+       y = "Proportion of channel length") +
+  theme(legend.title = element_blank(),
+        legend.key = element_rect(fill = "white"), 
+        legend.background = element_rect(fill = "transparent"),
+        legend.position = c(.23, .78))
+p3
+```
+
+This plot shows, for any contributing area across the range of those sampled by the survey reaches, what proportion of the surveyed channel length falls into each class. Consider that a classification model is basically looking at these proportions to assign the probability that a reach falls into any particular class. Things get confusing at the high-contributing-area end. From about 10 to 100 km^2^ the only reaches in our sample are large permanent, but above 100 km^2^ we have transitional, small permanent, and, at the very large end, more large permanent. Recall from @fig-density-by-count that above 100 km^2^, we only have a couple reaches, so our sample is insufficient to resolve any relationship there. It would be worthwhile to review these large-channel reaches and ensure that they have been correctly classified. With this sample, we may be best off truncating the sample at 100 km^2^ and calling anything with larger contributing area large permanent.
+
+We are not relying solely on contributing area to distinguish channel class. Landscape position is another variable that should progress from high to low values (ridgetop to valley):
+
+```{r}
+#| label: fig-survey-LP
+#| fig-cap: "Landscape position for all channel nodes by survey-reach class"
+p1 <- ggplot(data = survey, aes(x = LP_1500, color = SurvType)) +
+  stat_ecdf(geom = "step", linewidth = 1.2) +
+  scale_color_discrete(breaks = c('EPH', 'INT', 'TRANS', 'SMPRM', 'LGPRM'),
+                       labels = c('Ephemeral', 'Intermittent', 'Transitional',
+                                  'Small Permanent', 'Large Permanent')) +
+  labs(color = "Channel Class",
+       x = "Landscape Position",
+       y = "Proportion of Channel Length") +
+  theme(legend.key = element_rect(fill = "transparent"), 
+        legend.background = element_rect(fill = "transparent"),
+        legend.position = c(0.75, 0.23))
+
+p2 = ggplot(data = survey, aes(x = SurvType, y = LP_1500, fill = SurvType), show.legend) +
+  geom_boxplot(show.legend = FALSE) +
+  coord_cartesian(ylim = c(0.0, 1.)) +  
+  labs(x = "Channel Type", 
+       y = "Landscape Position")
+
+p1 + p2
+```
+
+Landscape position shows a progression with smaller channels generally higher in the landscape than larger channels, although again with a lot of overlap, except for large permanent, for which all the surveyed channels were at the valley floor.
+
+Incision?
+
+```{r}
+#| label: fig-survey-incise
+#| fig-cap: "Depth of channel incision for all channel nodes by survey reach class."
+p1 <- ggplot(data = survey, aes(x = INCISE10, color = SurvType)) +
+  stat_ecdf(geom = "step", linewidth = 1.2) +
+  scale_color_discrete(breaks = c('EPH', 'INT', 'TRANS', 'SMPRM', 'LGPRM'),
+                      labels = c('Ephemeral', 'Intermittent', 'Transitional',
+                                 'Small Permanent', 'Large Permanent')) +
+  labs(color = "Channel Class",
+       x = "Depth of Channel Incision (m)",
+       y = "Proportion of Channel Length") +
+  coord_cartesian(xlim = c(0., 5.)) +
+  theme(legend.position = c(0.55, 0.22))
+
+p2 <- ggplot(data = survey, aes(x = SurvType, y = INCISE10, fill = SurvType)) +
+  geom_boxplot() +
+  coord_cartesian(ylim = c(0., 5.)) +
+  scale_fill_discrete(breaks = c('EPH', 'INT', 'TRANS', 'SMPRM', 'LGPRM'),
+                      labels = c('Ephemeral', 'Intermittent', 'Transitional','Small Permanent', 'Large Permanent')) +
+  labs(x = "Channel Type", y = "Incision depth (m)") +
+  theme(legend.title = element_blank(),
+        legend.key = element_rect(fill = "transparent"), 
+        legend.background = element_rect(fill = "transparent"),
+        legend.position = c(0.25, 0.84))
+
+p1 + p2
+```
+
+This looks promising. Channel gradient?
+
+```{r}
+#| label: fig-survey-grad
+#| fig-cap: "Channel gradient, measured over a 20-m window, for all channel nodes in each survey-reach class."
+p1 <- ggplot(data = survey, aes(x = GRAD20, color = SurvType)) +
+  stat_ecdf(geom = "step", linewidth = 1.2) +
+  coord_cartesian(xlim = c(0., 0.3)) +
+  scale_color_discrete(breaks = c('EPH', 'INT', 'TRANS', 'SMPRM', 'LGPRM'),
+                       labels = c('Ephemeral', 'Intermittent', 'Transitional',
+                                 'Small Permanent', 'Large Permant')) +
+  labs(color = "Channel Class", 
+       x = "Channel Gradient",
+       y = "Proportion of Channel Length") +
+  theme(legend.position = c(.65, 0.25))
+
+p2 <- ggplot(data = survey, aes(x = SurvType, y = GRAD20, fill = SurvType)) +
+  geom_boxplot(show.legend = FALSE) +
+  coord_cartesian(ylim = c(0., 0.3)) +
+  scale_fill_discrete("Channel Type",
+                      breaks = c('EPH', 'INT', 'TRANS', 'SMPRM', 'LGPRM'),
+                      labels = c('Ephemeral', 'Intermittent', 'Transitional','Small Permanent', 'Large Permanent')) +
+  labs(x = "Channel Type", y = "Channel Gradient")
+
+p1 + p2
+```
+
+Not promising. Ephemeral, intermittent, and transitional completely overlap. Permanent channels tend to have lower gradients, but these are already distinguished by other attributes, particularly contributing area. Gradient may only confuse things.
+
+```{r}
+#| label: fig-survey_meangrad
+#| fig-cap: "Contributing-area mean gradient for all channel nodes in each survey-reach class."
+p1 <- ggplot(data = survey, aes(x = MeanGrad, color = SurvType)) +
+  stat_ecdf(geom = "step", linewidth = 1.2) +
+  coord_cartesian(xlim = c(0., 0.4)) +
+  scale_color_discrete(breaks = c('EPH', 'INT', 'TRANS', 'SMPRM', 'LGPRM'),
+                       labels = c('Ephemeral', 'Intermittent', 'Transitional',
+                                 'Small Permanent', 'Large Permant')) +
+  labs(color = "Channel Class", 
+       x = "Mean Contributing-Area Gradient",
+       y = "Proportion of Channel Length") +
+  theme(legend.position = c(.65, 0.25))
+
+p2 <- ggplot(data = survey, aes(x = SurvType, y = MeanGrad, fill = SurvType)) +
+  geom_boxplot(show.legend = FALSE) +
+  coord_cartesian(ylim = c(0., 0.4)) +
+  scale_fill_discrete("Channel Type",
+                      breaks = c('EPH', 'INT', 'TRANS', 'SMPRM', 'LGPRM'),
+                      labels = c('Ephemeral', 'Intermittent', 'Transitional','Small Permanent', 'Large Permanent')) +
+  labs(x = "Channel Type", y = "Mean Contributing-Area Gradient")
+
+p1 + p2
+```
+
+This also does not look particularly informative. What we miss with these plots, however, are potential interactions between variables. It may be that the influence of contributing area varyies with channel gradient or with the steepness of the contributing area.
+
+Here is deviation from mean elevation along channels.
+
+```{r}
+#| label: fig-survey-DEV
+#| fig-cap: "Deviation from mean elevation for all channel nodes in each survey-reach class."
+p1 <- ggplot(data = survey, aes(x = DEV10, color = SurvType)) +
+  stat_ecdf(geom = "step", linewidth = 1.2) +
+  coord_cartesian(xlim = c(0., 8)) +
+  scale_color_discrete(breaks = c('EPH', 'INT', 'TRANS', 'SMPRM', 'LGPRM'),
+                       labels = c('Ephemeral', 'Intermittent', 'Transitional',
+                                 'Small Permanent', 'Large Permant')) +
+  labs(color = "Channel Class", 
+       x = "DEV",
+       y = "Proportion of Channel Length") +
+  theme(legend.position = c(.65, 0.25))
+
+p2 <- ggplot(data = survey, aes(x = SurvType, y = DEV10, fill = SurvType)) +
+  geom_boxplot(show.legend = FALSE) +
+  coord_cartesian(ylim = c(0., 8)) +
+  scale_fill_discrete("Channel Type",
+                      breaks = c('EPH', 'INT', 'TRANS', 'SMPRM', 'LGPRM'),
+                      labels = c('Ephemeral', 'Intermittent', 'Transitional','Small Permanent', 'Large Permanent')) +
+  labs(x = "Channel Type", y = "DEV")
+
+p1 + p2
+```
+
+It appears that use of a fixed radius may be biasing these results. The large permanent channels may not have channel-adjacent slopes sufficiently sampled. We can try some other values here.
+
+As a start, we can build a model with contributing area (using the logarithm), landscape position, and depth of incision. We'll use ordinal logistic regression (which I'll explain in the next iteration of this doc). The next code chunk builds four models using the [lrm](https://search.r-project.org/CRAN/refmans/rms/html/lrm.html "Logistic Regression Model") function from the [rms](https://hbiostat.org/r/rms/ "Regression Modeling Strategies") R package[^1], starting with a single predictor, contributing area (using a log10 transformation), then adding landscape position, depth of incision, and interactions in subsequent models.
+
+[^1]: I particularly like this package. It has an associated [textbook](https://hbiostat.org/doc/rms/book/) with detailed explanations of the strategy behind the models.
+
+```{r}
+survData <- survey[, .(SurvType, AREA_SQKM, ELEV_M, GRAD20, LP_1500, INCISE10, DIF10, DEV10, PLAN10, MeanGrad)]
+survData <- survData[, log10Area := log10(AREA_SQKM)]
+
+m1 <- rms::lrm(SurvType ~ log10Area, data=survData, x=TRUE, y=TRUE, maxit=10000)
+
+m2 <- rms::lrm(SurvType ~ log10Area + INCISE10, data=survData, x=TRUE, y=TRUE, maxit=10000)
+
+m3 <- rms::lrm(SurvType ~ log10Area + INCISE10 + log10Area*INCISE10, data=survData, x=TRUE, y=TRUE, maxit=10000)
+
+m4 <- rms::lrm(SurvType ~ log10Area + LP_1500 + INCISE10, data = survData, x = TRUE, y = TRUE, maxit = 10000)
+
+m5 <- rms::lrm(SurvType ~ log10Area + LP_1500 + INCISE10 + log10Area*LP_1500 + log10Area*INCISE10, data = survData, x = TRUE, y = TRUE, maxit = 10000)
+
+m6 <- rms::lrm(SurvType ~ rcs(log10Area,4), data = survData, x = TRUE, y = TRUE, maxit=10000)
+
+```
+
+Here are confusion matrices for each model.
+
+```{r}
+# Translate the survey data to a 5-level factor 
+d_class <- survData[, class := fifelse(SurvType == "EPH", 1, fifelse(SurvType == "INT", 2, fifelse(SurvType == "TRANS", 3, fifelse(SurvType == "SMPRM", 4, 5))))]
+d_class <- d_class[,class] %>% factor(levels = c(1,2,3,4,5))
+
+p_m1 <- as.data.table(predict(m1, type = "fitted.ind"))
+m1_class <- p_m1[,max.col(.SD,ties.method="first")]
+
+m1_class <- factor(m1_class, levels = c(1,2,3,4,5))
+```
+
+```{r}
+cm1 <- confusionMatrix(m1_class,d_class)
+tm1 <- as.data.table(cm1$table)
+n1 <- tm1[Reference==1, sum(N)]
+n2 <- tm1[Reference==2, sum(N)]
+n3 <- tm1[Reference==3, sum(N)]
+n4 <- tm1[Reference==4, sum(N)]
+n5 <- tm1[Reference==5, sum(N)]
+tmp <- tm1[, P := (fifelse(Reference==1, N/n1, fifelse(Reference==2, N/n2, fifelse(Reference==3, N/n3, ifelse(Reference==4, N/n4, ifelse(Reference==5, N/n5, 0))))))]
+```
+
+| Prediction      |  Ephemeral   | Intermittent  | Transitional  | Small Permanent | Large Permanent |
+|:-----------|:----------:|:----------:|:----------:|:----------:|:----------:|
+| Ephemeral       | `r tmp[1,4]` | `r tmp[6,4]`  | `r tmp[11,4]` |  `r tmp[16,4]`  |  `r tmp[21,4]`  |
+| Intermittent    | `r tmp[2,4]` | `r tmp[7,4]`  | `r tmp[12,4]` |  `r tmp[17,4]`  |  `r tmp[22,4]`  |
+| Transitional    | `r tmp[3,4]` | `r tmp[8,4]`  | `r tmp[13,4]` |  `r tmp[18,4]`  |  `r tmp[23,4]`  |
+| Small Permanent | `r tmp[4,4]` | `r tmp[9,4]`  | `r tmp[14,4]` |  `r tmp[19,4]`  |  `r tmp[24,4]`  |
+| Large Permanent | `r tmp[5,4]` | `r tmp[10,4]` | `r tmp[15,4]` |  `r tmp[20,4]`  |  `r tmp[25,4]`  |
+
+: Confusion matrix by proportion of each class, model 1 (Area).
+
+I've plotted these so that the terms in each row show the proportion of surveyed channel length predicted to be in the class of each column. For the above matrix, 86% of the ephemeral reach length was classified as ephermeral, 13.6% as intermittent, 0% as transitional, 0.3% as small permanent, and 0% as large permanent. All rows in each column sum to 100% as the total predicted length, summed over all predicted classes, equals the observed length. The diagonals show what proportion of each class was correctly classified. This value is called the [sensitivity](https://en.wikipedia.org/wiki/Sensitivity_and_specificity) (also known as the tree positive rate or recall):
+
+$$
+sensitivity = \frac{length_correctly_classified}{total_length_in_class}
+$$ {#eq-sensitivity}
+
+Note that no portion of any reach was predicted to be transitional. @fig-proportions shows why: there is no contributing area for which the transitional class is the majority length.
+
+The next two confusion matrices report model results as we add the predictors for landscape position and depth of channel incision.
+
+Model 2: Log10(contributing area) and depth of incision.
+
+```{r}
+#| echo: true
+#| output: true
+p_m2 <- as.data.table(predict(m2, type = "fitted.ind"))
+m2_class <- p_m2[,max.col(.SD,ties.method="first")] %>% factor(levels = c(1,2,3,4,5))
+cm2 <- confusionMatrix(m2_class,d_class)
+
+tm2 <- as.data.table(cm2$table)
+n1 <- tm2[Reference==1, sum(N)]
+n2 <- tm2[Reference==2, sum(N)]
+n3 <- tm2[Reference==3, sum(N)]
+n4 <- tm2[Reference==4, sum(N)]
+n5 <- tm2[Reference==5, sum(N)]
+tmp <- tm2[, P := (fifelse(Reference==1, N/n1, fifelse(Reference==2, N/n2, fifelse(Reference==3, N/n3, ifelse(Reference==4, N/n4, ifelse(Reference==5, N/n5, 0))))))]
+```
+
+| Prediction      |  Ephemeral   | Intermittent  | Transitional  | Small Permanent | Large Permanent |
+|:-----------|:----------:|:----------:|:----------:|:----------:|:----------:|
+| Ephemeral       | `r tmp[1,4]` | `r tmp[6,4]`  | `r tmp[11,4]` |  `r tmp[16,4]`  |  `r tmp[21,4]`  |
+| Intermittent    | `r tmp[2,4]` | `r tmp[7,4]`  | `r tmp[12,4]` |  `r tmp[17,4]`  |  `r tmp[22,4]`  |
+| Transitional    | `r tmp[3,4]` | `r tmp[8,4]`  | `r tmp[13,4]` |  `r tmp[18,4]`  |  `r tmp[23,4]`  |
+| Small Permanent | `r tmp[4,4]` | `r tmp[9,4]`  | `r tmp[14,4]` |  `r tmp[19,4]`  |  `r tmp[24,4]`  |
+| Large Permanent | `r tmp[5,4]` | `r tmp[10,4]` | `r tmp[15,4]` |  `r tmp[20,4]`  |  `r tmp[25,4]`  |
+
+: Confusion matrix by proportion of each class, model 2 (Area + Incision).
+
+Model 3: Log10(contributing area), depth of incision, and interaction of area and incision.
+
+```{r}
+p_m3 <- as.data.table(predict(m3, type = "fitted.ind"))
+m3_class <- p_m3[,max.col(.SD,ties.method="first")] %>% factor(levels = c(1,2,3,4,5))
+cm3 <- confusionMatrix(m3_class,d_class)
+tm3 <- as.data.table(cm3$table)
+n1 <- tm3[Reference==1, sum(N)]
+n2 <- tm3[Reference==2, sum(N)]
+n3 <- tm3[Reference==3, sum(N)]
+n4 <- tm3[Reference==4, sum(N)]
+n5 <- tm3[Reference==5, sum(N)]
+tmp <- tm3[, P := (fifelse(Reference==1, N/n1, fifelse(Reference==2, N/n2, fifelse(Reference==3, N/n3, ifelse(Reference==4, N/n4, ifelse(Reference==5, N/n5, 0))))))]
+```
+
+| Prediction      |  Ephemeral   | Intermittent  | Transitional  | Small Permanent | Large Permanent |
+|:-----------|:----------:|:----------:|:----------:|:----------:|:----------:|
+| Ephemeral       | `r tmp[1,4]` | `r tmp[6,4]`  | `r tmp[11,4]` |  `r tmp[16,4]`  |  `r tmp[21,4]`  |
+| Intermittent    | `r tmp[2,4]` | `r tmp[7,4]`  | `r tmp[12,4]` |  `r tmp[17,4]`  |  `r tmp[22,4]`  |
+| Transitional    | `r tmp[3,4]` | `r tmp[8,4]`  | `r tmp[13,4]` |  `r tmp[18,4]`  |  `r tmp[23,4]`  |
+| Small Permanent | `r tmp[4,4]` | `r tmp[9,4]`  | `r tmp[14,4]` |  `r tmp[19,4]`  |  `r tmp[24,4]`  |
+| Large Permanent | `r tmp[5,4]` | `r tmp[10,4]` | `r tmp[15,4]` |  `r tmp[20,4]`  |  `r tmp[25,4]`  |
+
+: Confusion matrix by proportion of each class, model 3 (Area, Incision, Area*Incision).
+
+The next model adds landscape position.
+
+Model 4: Log10(contributing area), landscape position, and depth of incision.
+
+```{r}
+p_m4 <- as.data.table(predict(m4, type = "fitted.ind"))
+m4_class <- p_m4[,max.col(.SD,ties.method="first")] %>% factor(levels = c(1,2,3,4,5))
+cm4 <- confusionMatrix(m4_class,d_class)
+tm4 <- as.data.table(cm4$table)
+n1 <- tm4[Reference==1, sum(N)]
+n2 <- tm4[Reference==2, sum(N)]
+n3 <- tm4[Reference==3, sum(N)]
+n4 <- tm4[Reference==4, sum(N)]
+n5 <- tm4[Reference==5, sum(N)]
+tmp <- tm4[, P := (fifelse(Reference==1, N/n1, fifelse(Reference==2, N/n2, fifelse(Reference==3, N/n3, ifelse(Reference==4, N/n4, ifelse(Reference==5, N/n5, 0))))))]
+```
+
+| Prediction      |  Ephemeral   | Intermittent  | Transitional  | Small Permanent | Large Permanent |
+|:-----------|:----------:|:----------:|:----------:|:----------:|:----------:|
+| Ephemeral       | `r tmp[1,4]` | `r tmp[6,4]`  | `r tmp[11,4]` |  `r tmp[16,4]`  |  `r tmp[21,4]`  |
+| Intermittent    | `r tmp[2,4]` | `r tmp[7,4]`  | `r tmp[12,4]` |  `r tmp[17,4]`  |  `r tmp[22,4]`  |
+| Transitional    | `r tmp[3,4]` | `r tmp[8,4]`  | `r tmp[13,4]` |  `r tmp[18,4]`  |  `r tmp[23,4]`  |
+| Small Permanent | `r tmp[4,4]` | `r tmp[9,4]`  | `r tmp[14,4]` |  `r tmp[19,4]`  |  `r tmp[24,4]`  |
+| Large Permanent | `r tmp[5,4]` | `r tmp[10,4]` | `r tmp[15,4]` |  `r tmp[20,4]`  |  `r tmp[25,4]`  |
+
+: Confusion matrix by proportion of each class, model 4 (Area, Incision, Landscape Position).
+
+Model 5 includes interactions of area with incision and landscape position.
+
+```{r}
+p_m5 <- as.data.table(predict(m5, type = "fitted.ind"))
+m5_class <- p_m5[,max.col(.SD,ties.method="first")] %>% factor(levels = c(1,2,3,4,5))
+cm5 <- confusionMatrix(m5_class,d_class)
+tm5 <- as.data.table(cm5$table)
+n1 <- tm5[Reference==1, sum(N)]
+n2 <- tm5[Reference==2, sum(N)]
+n3 <- tm5[Reference==3, sum(N)]
+n4 <- tm5[Reference==4, sum(N)]
+n5 <- tm5[Reference==5, sum(N)]
+tmp <- tm5[, P := (fifelse(Reference==1, N/n1, fifelse(Reference==2, N/n2, fifelse(Reference==3, N/n3, ifelse(Reference==4, N/n4, ifelse(Reference==5, N/n5, 0))))))]
+```
+
+| Prediction      |  Ephemeral   | Intermittent  | Transitional  | Small Permanent | Large Permanent |
+|:-----------|:----------:|:----------:|:----------:|:----------:|:----------:|
+| Ephemeral       | `r tmp[1,4]` | `r tmp[6,4]`  | `r tmp[11,4]` |  `r tmp[16,4]`  |  `r tmp[21,4]`  |
+| Intermittent    | `r tmp[2,4]` | `r tmp[7,4]`  | `r tmp[12,4]` |  `r tmp[17,4]`  |  `r tmp[22,4]`  |
+| Transitional    | `r tmp[3,4]` | `r tmp[8,4]`  | `r tmp[13,4]` |  `r tmp[18,4]`  |  `r tmp[23,4]`  |
+| Small Permanent | `r tmp[4,4]` | `r tmp[9,4]`  | `r tmp[14,4]` |  `r tmp[19,4]`  |  `r tmp[24,4]`  |
+| Large Permanent | `r tmp[5,4]` | `r tmp[10,4]` | `r tmp[15,4]` |  `r tmp[20,4]`  |  `r tmp[25,4]`  |
+
+: Confusion matrix by proportion of each class, model 5 (Area, Incision, Landscape Position, Area*Incision, Area*Landscape Position).
+
+The last model allows a nonlinear relationship between the log odds and area using a cubic spline.
+
+```{r}
+p_m6 <- as.data.table(predict(m6, type = "fitted.ind"))
+m6_class <- p_m6[,max.col(.SD,ties.method="first")] %>% factor(levels = c(1,2,3,4,5))
+cm6 <- confusionMatrix(m6_class,d_class)
+tm6 <- as.data.table(cm6$table)
+n1 <- tm6[Reference==1, sum(N)]
+n2 <- tm6[Reference==2, sum(N)]
+n3 <- tm6[Reference==3, sum(N)]
+n4 <- tm6[Reference==4, sum(N)]
+n5 <- tm6[Reference==5, sum(N)]
+tmp <- tm6[, P := (fifelse(Reference==1, N/n1, fifelse(Reference==2, N/n2, fifelse(Reference==3, N/n3, ifelse(Reference==4, N/n4, ifelse(Reference==5, N/n5, 0))))))]
+```
+
+| Prediction      |  Ephemeral   | Intermittent  | Transitional  | Small Permanent | Large Permanent |
+|:-----------|:----------:|:----------:|:----------:|:----------:|:----------:|
+| Ephemeral       | `r tmp[1,4]` | `r tmp[6,4]`  | `r tmp[11,4]` |  `r tmp[16,4]`  |  `r tmp[21,4]`  |
+| Intermittent    | `r tmp[2,4]` | `r tmp[7,4]`  | `r tmp[12,4]` |  `r tmp[17,4]`  |  `r tmp[22,4]`  |
+| Transitional    | `r tmp[3,4]` | `r tmp[8,4]`  | `r tmp[13,4]` |  `r tmp[18,4]`  |  `r tmp[23,4]`  |
+| Small Permanent | `r tmp[4,4]` | `r tmp[9,4]`  | `r tmp[14,4]` |  `r tmp[19,4]`  |  `r tmp[24,4]`  |
+| Large Permanent | `r tmp[5,4]` | `r tmp[10,4]` | `r tmp[15,4]` |  `r tmp[20,4]`  |  `r tmp[25,4]`  |
+
+: Confusion matrix by proportion of each class, model 6 (nonlinear Area).
+
+Allowing the contribution of the log of contributing area to be nonlinear improves the classification accuracy from `r cm1$overall["Accuracy"]` for a linear relationship to `r cm6$overall["Accuracy"]`.
+
+More to come on how to interpret all this, but overall - as Figure 9 indicates - ability to discern channel types is poor. Indeed, assigning channel class based on the largest probability, the models do not classify any reach as Transitional. As we added variables, model performance improved. I'll continue to experiment with other potential predictors.
+
+We know our sample is unbalanced. Figures @fig-density-by-count and @fig-normalized-density show that, for contributing area above about 0.01 km^2^, the survey reaches undersample the entire network. We also see from @fig-num-nodes that the transitional channels are undersampled. There are several strategies to deal with unbalanced data: 1) undersampling the lower contributing area values, 2) oversampling the larger contributing area values, and 3) identifying optimal cut points for transitioning from one class to the next. I am reluctant to play with the data by under- or over-sampling (see e.g., [this blog post by Frank Harrell](https://www.fharrell.com/post/classification/)) and will try instead use of a cost function to pick probability cut-off points for progressing from one channel class to the next.
+
+We can consider the proportional odds ordinal logistic regression as a series of binomial regressions with constant slope (fixed effects). Given our data and an appropriate cost function, we can find the probability value that minimizes the cost for each transition. For this, I'll use the R package [cutpointr](https://cran.r-project.org/web/packages/cutpointr/index.html). There are a variety of choices for determining the optimal cut point [@thiele2021]. For our purposes, I find the threshold that maximizes the accuracy of the classification. Accuracy is defined here as the proportion of correctly classified channel nodes. We will be working our way up from ephemeral to large permanent channels, so classification at each step is to separate nodes below the transition from those above. For example, the first cut point finds the modeled probability that maximizes the proportion of all nodes in the surveyed ephemeral class correctly distinguished from nodes in all other classes. The next cut point finds the modeled probability that maximizes the proportion of all nodes in the surveyed ephemeral and intermittent classes correctly distinguished from the other classes, and so on.
+
+```{r}
+# Separate data to EPH and all others.
+setnames(p_m1, c("EPH", "INT", "TRANS", "SMPRM", "LGPRM"))
+p_m1 <- p_m1[, psum1 := EPH]
+p_m1 <- p_m1[, psum2 := psum1 + INT]
+p_m1 <- p_m1[, psum3 := psum2 + TRANS]
+p_m1 <- p_m1[, psum4 := psum3 + SMPRM]
+
+# Get cut points
+eph <- survData[, iclass := fifelse(SurvType == "EPH", 1 , 0)]
+eph <- eph[, .(iclass)]
+eph <- eph[, p := p_m1[,psum1]]
+cut1 <- cutpointr(eph,p,iclass,method = maximize_metric, metric=accuracy, pos_class= 1, direction = ">=")
+c1 <- cut1$optimal_cutpoint
+
+int <- survData[, iclass := fifelse(SurvType == "EPH", 1, 
+                                   fifelse(SurvType == "INT", 1, 0))]
+int <- int[, .(iclass)]
+int <- int[, p := p_m1[, psum2]]
+cut2 <- cutpointr(int,p,iclass,method = maximize_metric,metric=accuracy,pos_class=1,direction = ">=")
+c2 <- cut2$optimal_cutpoint
+
+trans <- survData[, iclass := fifelse(SurvType == "EPH", 1,
+                                      fifelse(SurvType == "INT", 1,
+                                              fifelse(SurvType == "TRANS", 1, 0)))]
+trans <- trans[, .(iclass)]
+trans <- trans[, p := p_m1[, psum3]]
+cut3 <- cutpointr(trans,p,iclass,method=maximize_metric,metric=accuracy,pos_class=1,direction=">=")
+c3 <- cut3$optimal_cutpoint
+
+smprm <- survData[, iclass := fifelse(SurvType == "EPH", 1,
+                                      fifelse(SurvType == "INT", 1,
+                                              fifelse(SurvType == "TRANS", 1, 
+                                                      fifelse(SurvType == "SMPRM", 1, 0))))]
+smprm <- smprm[, .(iclass)]
+smprm <- smprm[, p := p_m1[, psum4]]
+cut4 <- cutpointr(smprm,p,iclass,method=maximize_metric,metric=accuracy,pos_class=1,direction=">=")
+c4 <- cut4$optimal_cutpoint
+```
+
+Here are the cut points found for model 1:
+
+| Transition                         | Probability |
+|------------------------------------|-------------|
+| Ephemeral to Intermittent          | `r c1`      |
+| Intermittent to Transitional       | `r c2`      |
+| Transitional to Small Permanent    | `r c3`      |
+| Small Permanent to Large Permanent | `r c4`      |
+
+: Probability cut points for channel-class transitions, model 1.
+
+Here is the confusion matrix:
+
+```{r}
+p_m1 <- p_m1[, p1 := EPH]
+p_m1 <- p_m1[, p2 := EPH + INT]
+p_m1 <- p_m1[, p3 := EPH + INT + TRANS]
+p_m1 <- p_m1[, p4 := EPH + INT + TRANS + SMPRM]
+p_1 <- p_m1[, class := ifelse(p1 >= c1, 1,
+                               ifelse(p2 >= c2, 2,
+                                      ifelse(p3 >= c3, 3,
+                                             ifelse(p4 >= c4, 4, 5))))]
+
+p_1 <- factor(p_m1$class, levels = c(1,2,3,4,5))
+
+cm1cut <- confusionMatrix(p_1,d_class)
+tm1 <- as.data.table(cm1cut$table)
+n1 <- tm1[Reference==1, sum(N)]
+n2 <- tm1[Reference==2, sum(N)]
+n3 <- tm1[Reference==3, sum(N)]
+n4 <- tm1[Reference==4, sum(N)]
+n5 <- tm1[Reference==5, sum(N)]
+tmp <- tm1[, P := (fifelse(Reference==1, N/n1, fifelse(Reference==2, N/n2, fifelse(Reference==3, N/n3, ifelse(Reference==4, N/n4, ifelse(Reference==5, N/n5, 0))))))]
+```
+| Prediction      |  Ephemeral   | Intermittent  | Transitional  | Small Permanent | Large Permanent |
+|:-----------|:----------:|:----------:|:----------:|:----------:|:----------:|
+| Ephemeral       | `r tmp[1,4]` | `r tmp[6,4]`  | `r tmp[11,4]` |  `r tmp[16,4]`  |  `r tmp[21,4]`  |
+| Intermittent    | `r tmp[2,4]` | `r tmp[7,4]`  | `r tmp[12,4]` |  `r tmp[17,4]`  |  `r tmp[22,4]`  |
+| Transitional    | `r tmp[3,4]` | `r tmp[8,4]`  | `r tmp[13,4]` |  `r tmp[18,4]`  |  `r tmp[23,4]`  |
+| Small Permanent | `r tmp[4,4]` | `r tmp[9,4]`  | `r tmp[14,4]` |  `r tmp[19,4]`  |  `r tmp[24,4]`  |
+| Large Permanent | `r tmp[5,4]` | `r tmp[10,4]` | `r tmp[15,4]` |  `r tmp[20,4]`  |  `r tmp[25,4]`  |
+
+: Confusion matrix by proportion of each class, model 1 using cut points.
+
+```{r}
+# Separate data to EPH and all others.
+setnames(p_m2, c("EPH", "INT", "TRANS", "SMPRM", "LGPRM"))
+p_m2 <- p_m2[, psum1 := EPH]
+p_m2 <- p_m2[, psum2 := psum1 + INT]
+p_m2 <- p_m2[, psum3 := psum2 + TRANS]
+p_m2 <- p_m2[, psum4 := psum3 + SMPRM]
+
+eph <- survData[, iclass := fifelse(SurvType == "EPH", 1, 0)]
+eph <- eph[, p := p_m2[,psum1]]
+cut1 <- cutpointr(eph,p,iclass,method = maximize_metric, metric=accuracy, pos_class=1, direction = ">=")
+c1 <- cut1$optimal_cutpoint
+
+int <- survData[, iclass := fifelse(SurvType == "EPH", 1, 
+                                   fifelse(SurvType == "INT", 1, 0))]
+int <- int[, .(iclass)]
+int <- int[, p := p_m2[, psum2]]
+cut2 <- cutpointr(int,p,iclass,method = maximize_metric,metric=accuracy,pos_class=1,direction=">=")
+c2 <- cut2$optimal_cutpoint
+
+trans <- survData[, iclass := fifelse(SurvType == "EPH", 1,
+                                      fifelse(SurvType == "INT", 1,
+                                              fifelse(SurvType == "TRANS", 1, 0)))]
+trans <- trans[, .(iclass)]
+trans <- trans[, p := p_m2[, psum3]]
+cut3 <- cutpointr(trans,p,iclass,method=maximize_metric,metric=accuracy,pos_class=1,direction=">=")
+c3 <- cut3$optimal_cutpoint
+
+smprm <- survData[, iclass := fifelse(SurvType == "EPH", 1,
+                                      fifelse(SurvType == "INT", 1,
+                                              fifelse(SurvType == "TRANS", 1, 
+                                                      fifelse(SurvType == "SMPRM", 1, 0))))]
+smprm <- smprm[, .(iclass)]
+smprm <- smprm[, p := p_m2[, psum4]]
+cut4 <- cutpointr(smprm,p,iclass,method=maximize_metric,metric=accuracy,pos_class=1,direction=">=")
+c4 <- cut4$optimal_cutpoint
+```
+
+Here are the cut points found for model 2:
+
+| Transition                         | Probability |
+|------------------------------------|-------------|
+| Ephemeral to Intermittent          | `r c1`      |
+| Intermittent to Transitional       | `r c2`      |
+| Transitional to Small Permanent    | `r c3`      |
+| Small Permanent to Large Permanent | `r c4`      |
+
+: Probability cut points for channel-class transitions, model 2.
+
+and it's associated confusion matrix.
+
+```{r}
+p_m2 <- p_m2[, p1 := EPH]
+p_m2 <- p_m2[, p2 := EPH + INT]
+p_m2 <- p_m2[, p3 := EPH + INT + TRANS]
+p_m2 <- p_m2[, p4 := EPH + INT + TRANS + SMPRM]
+p_2 <- p_m2[, class := ifelse(p1 >= c1, 1,
+                               ifelse(p2 >= c2, 2,
+                                      ifelse(p3 >= c3, 3,
+                                             ifelse(p4 >= c4, 4, 5))))]
+
+p_2 <- factor(p_m2$class, levels = c(1,2,3,4,5))
+
+cm2cut <- confusionMatrix(p_2,d_class)
+tm2 <- as.data.table(cm2cut$table)
+n1 <- tm2[Reference==1, sum(N)]
+n2 <- tm2[Reference==2, sum(N)]
+n3 <- tm2[Reference==3, sum(N)]
+n4 <- tm2[Reference==4, sum(N)]
+n5 <- tm2[Reference==5, sum(N)]
+tmp <- tm2[, P := (fifelse(Reference==1, N/n1, fifelse(Reference==2, N/n2, fifelse(Reference==3, N/n3, ifelse(Reference==4, N/n4, ifelse(Reference==5, N/n5, 0))))))]
+```
+| Prediction      |  Ephemeral   | Intermittent  | Transitional  | Small Permanent | Large Permanent |
+|:-----------|:----------:|:----------:|:----------:|:----------:|:----------:|
+| Ephemeral       | `r tmp[1,4]` | `r tmp[6,4]`  | `r tmp[11,4]` |  `r tmp[16,4]`  |  `r tmp[21,4]`  |
+| Intermittent    | `r tmp[2,4]` | `r tmp[7,4]`  | `r tmp[12,4]` |  `r tmp[17,4]`  |  `r tmp[22,4]`  |
+| Transitional    | `r tmp[3,4]` | `r tmp[8,4]`  | `r tmp[13,4]` |  `r tmp[18,4]`  |  `r tmp[23,4]`  |
+| Small Permanent | `r tmp[4,4]` | `r tmp[9,4]`  | `r tmp[14,4]` |  `r tmp[19,4]`  |  `r tmp[24,4]`  |
+| Large Permanent | `r tmp[5,4]` | `r tmp[10,4]` | `r tmp[15,4]` |  `r tmp[20,4]`  |  `r tmp[25,4]`  |
+
+: Confusion matrix by proportion of each class, model 2 using cut points.
+
+```{r}
+# Separate data to EPH and all others.
+setnames(p_m3, c("EPH", "INT", "TRANS", "SMPRM", "LGPRM"))
+p_m3 <- p_m3[, psum1 := EPH]
+p_m3 <- p_m3[, psum2 := psum1 + INT]
+p_m3 <- p_m3[, psum3 := psum2 + TRANS]
+p_m3 <- p_m3[, psum4 := psum3 + SMPRM]
+
+eph <- survData[, iclass := fifelse(SurvType == "EPH", 1, 0)]
+eph <- eph[, p := p_m3[,psum1]]
+cut1 <- cutpointr(eph,p,iclass,method = maximize_metric, metric=accuracy, pos_class=1, direction = ">=")
+c1 <- cut1$optimal_cutpoint
+
+int <- survData[, iclass := fifelse(SurvType == "EPH", 1, 
+                                   fifelse(SurvType == "INT", 1, 0))]
+int <- int[, .(iclass)]
+int <- int[, p := p_m3[, psum2]]
+cut2 <- cutpointr(int,p,iclass,method = maximize_metric,metric=accuracy,pos_class=1,direction=">=")
+c2 <- cut2$optimal_cutpoint
+
+trans <- survData[, iclass := fifelse(SurvType == "EPH", 1,
+                                      fifelse(SurvType == "INT", 1,
+                                              fifelse(SurvType == "TRANS", 1, 0)))]
+trans <- trans[, .(iclass)]
+trans <- trans[, p := p_m3[, psum3]]
+cut3 <- cutpointr(trans,p,iclass,method=maximize_metric,metric=accuracy,pos_class=1,direction=">=")
+c3 <- cut3$optimal_cutpoint
+
+smprm <- survData[, iclass := fifelse(SurvType == "EPH", 1,
+                                      fifelse(SurvType == "INT", 1,
+                                              fifelse(SurvType == "TRANS", 1, 
+                                                      fifelse(SurvType == "SMPRM", 1, 0))))]
+smprm <- smprm[, .(iclass)]
+smprm <- smprm[, p := p_m3[, psum4]]
+cut4 <- cutpointr(smprm,p,iclass,method=maximize_metric,metric=accuracy,pos_class=1,direction=">=")
+c4 <- cut4$optimal_cutpoint
+```
+
+Here are the cut points found for model 3:
+
+| Transition                         | Probability |
+|------------------------------------|-------------|
+| Ephemeral to Intermittent          | `r c1`      |
+| Intermittent to Transitional       | `r c2`      |
+| Transitional to Small Permanent    | `r c3`      |
+| Small Permanent to Large Permanent | `r c4`      |
+
+: Probability cut points for channel-class transitions, model 3.
+
+Here is the confusion matrix.
+
+```{r}
+p_m3 <- p_m3[, p1 := EPH]
+p_m3 <- p_m3[, p2 := EPH + INT]
+p_m3 <- p_m3[, p3 := EPH + INT + TRANS]
+p_m3 <- p_m3[, p4 := EPH + INT + TRANS + SMPRM]
+p_3 <- p_m3[, class := ifelse(p1 >= c1, 1,
+                               ifelse(p2 >= c2, 2,
+                                      ifelse(p3 >= c3, 3,
+                                             ifelse(p4 >= c4, 4, 5))))]
+
+p_3 <- factor(p_m3$class, levels = c(1,2,3,4,5))
+
+cm3cut <- confusionMatrix(p_3,d_class)
+tm3 <- as.data.table(cm3cut$table)
+n1 <- tm3[Reference==1, sum(N)]
+n2 <- tm3[Reference==2, sum(N)]
+n3 <- tm3[Reference==3, sum(N)]
+n4 <- tm3[Reference==4, sum(N)]
+n5 <- tm3[Reference==5, sum(N)]
+tmp <- tm3[, P := (fifelse(Reference==1, N/n1, fifelse(Reference==2, N/n2, fifelse(Reference==3, N/n3, ifelse(Reference==4, N/n4, ifelse(Reference==5, N/n5, 0))))))]
+```
+
+| Prediction      |  Ephemeral   | Intermittent  | Transitional  | Small Permanent | Large Permanent |
+|:-----------|:----------:|:----------:|:----------:|:----------:|:----------:|
+| Ephemeral       | `r tmp[1,4]` | `r tmp[6,4]`  | `r tmp[11,4]` |  `r tmp[16,4]`  |  `r tmp[21,4]`  |
+| Intermittent    | `r tmp[2,4]` | `r tmp[7,4]`  | `r tmp[12,4]` |  `r tmp[17,4]`  |  `r tmp[22,4]`  |
+| Transitional    | `r tmp[3,4]` | `r tmp[8,4]`  | `r tmp[13,4]` |  `r tmp[18,4]`  |  `r tmp[23,4]`  |
+| Small Permanent | `r tmp[4,4]` | `r tmp[9,4]`  | `r tmp[14,4]` |  `r tmp[19,4]`  |  `r tmp[24,4]`  |
+| Large Permanent | `r tmp[5,4]` | `r tmp[10,4]` | `r tmp[15,4]` |  `r tmp[20,4]`  |  `r tmp[25,4]`  |
+
+: Confusion matrix by proportion of each class, model 3 with cut points.
+
+```{r}
+# Separate data to EPH and all others.
+setnames(p_m4, c("EPH", "INT", "TRANS", "SMPRM", "LGPRM"))
+p_m4 <- p_m4[, psum1 := EPH]
+p_m4 <- p_m4[, psum2 := psum1 + INT]
+p_m4 <- p_m4[, psum3 := psum2 + TRANS]
+p_m4 <- p_m4[, psum4 := psum3 + SMPRM]
+
+eph <- survData[, iclass := fifelse(SurvType == "EPH", 1, 0)]
+#eph <- eph[, .(iclass)]
+eph <- eph[, p := p_m4[,psum1]]
+cut1 <- cutpointr(eph,p,iclass,method = maximize_metric, metric=accuracy, pos_class=1, direction = ">=")
+c1 <- cut1$optimal_cutpoint
+
+int <- survData[, iclass := fifelse(SurvType == "EPH", 1, 
+                                   fifelse(SurvType == "INT", 1, 0))]
+int <- int[, .(iclass)]
+int <- int[, p := p_m4[, psum2]]
+cut2 <- cutpointr(int,p,iclass,method = maximize_metric,metric=accuracy,pos_class=1,direction=">=")
+c2 <- cut2$optimal_cutpoint
+
+trans <- survData[, iclass := fifelse(SurvType == "EPH", 1,
+                                      fifelse(SurvType == "INT", 1,
+                                              fifelse(SurvType == "TRANS", 1, 0)))]
+trans <- trans[, .(iclass)]
+trans <- trans[, p := p_m4[, psum3]]
+cut3 <- cutpointr(trans,p,iclass,method=maximize_metric,metric=accuracy,pos_class=1,direction=">=")
+c3 <- cut3$optimal_cutpoint
+
+smprm <- survData[, iclass := fifelse(SurvType == "EPH", 1,
+                                      fifelse(SurvType == "INT", 1,
+                                              fifelse(SurvType == "TRANS", 1, 
+                                                      fifelse(SurvType == "SMPRM", 1, 0))))]
+smprm <- smprm[, .(iclass)]
+smprm <- smprm[, p := p_m4[, psum4]]
+cut4 <- cutpointr(smprm,p,iclass,method=maximize_metric,metric=accuracy,pos_class=1,direction=">=")
+c4 <- cut4$optimal_cutpoint
+```
+
+Here are the cut points found for model 4:
+
+| Transition                         | Probability |
+|------------------------------------|-------------|
+| Ephemeral to Intermittent          | `r c1`      |
+| Intermittent to Transitional       | `r c2`      |
+| Transitional to Small Permanent    | `r c3`      |
+| Small Permanent to Large Permanent | `r c4`      |
+
+: Probability cut points for channel-class transitions, model 4.
+
+and the confusion matrix.
+
+```{r}
+p_m4 <- p_m4[, p1 := EPH]
+p_m4 <- p_m4[, p2 := EPH + INT]
+p_m4 <- p_m4[, p3 := EPH + INT + TRANS]
+p_m4 <- p_m4[, p4 := EPH + INT + TRANS + SMPRM]
+p_4 <- p_m4[, class := ifelse(p1 >= c1, 1,
+                               ifelse(p2 >= c2, 2,
+                                      ifelse(p3 >= c3, 3,
+                                             ifelse(p4 >= c4, 4, 5))))]
+
+p_4 <- factor(p_m4$class, levels = c(1,2,3,4,5))
+
+cm4cut <- confusionMatrix(p_4,d_class)
+tm4 <- as.data.table(cm4cut$table)
+n1 <- tm4[Reference==1, sum(N)]
+n2 <- tm4[Reference==2, sum(N)]
+n3 <- tm4[Reference==3, sum(N)]
+n4 <- tm4[Reference==4, sum(N)]
+n5 <- tm4[Reference==5, sum(N)]
+tmp <- tm4[, P := (fifelse(Reference==1, N/n1, fifelse(Reference==2, N/n2, fifelse(Reference==3, N/n3, ifelse(Reference==4, N/n4, ifelse(Reference==5, N/n5, 0))))))]
+```
+
+| Prediction      |  Ephemeral   | Intermittent  | Transitional  | Small Permanent | Large Permanent |
+|:-----------|:----------:|:----------:|:----------:|:----------:|:----------:|
+| Ephemeral       | `r tmp[1,4]` | `r tmp[6,4]`  | `r tmp[11,4]` |  `r tmp[16,4]`  |  `r tmp[21,4]`  |
+| Intermittent    | `r tmp[2,4]` | `r tmp[7,4]`  | `r tmp[12,4]` |  `r tmp[17,4]`  |  `r tmp[22,4]`  |
+| Transitional    | `r tmp[3,4]` | `r tmp[8,4]`  | `r tmp[13,4]` |  `r tmp[18,4]`  |  `r tmp[23,4]`  |
+| Small Permanent | `r tmp[4,4]` | `r tmp[9,4]`  | `r tmp[14,4]` |  `r tmp[19,4]`  |  `r tmp[24,4]`  |
+| Large Permanent | `r tmp[5,4]` | `r tmp[10,4]` | `r tmp[15,4]` |  `r tmp[20,4]`  |  `r tmp[25,4]`  |
+
+: Confusion matrix by proportion of each class, model 4 with cut points.
+
+```{r}
+# Separate data to EPH and all others.
+setnames(p_m5, c("EPH", "INT", "TRANS", "SMPRM", "LGPRM"))
+p_m5 <- p_m5[, psum1 := EPH]
+p_m5 <- p_m5[, psum2 := psum1 + INT]
+p_m5 <- p_m5[, psum3 := psum2 + TRANS]
+p_m5 <- p_m5[, psum4 := psum3 + SMPRM]
+
+eph <- survData[, iclass := fifelse(SurvType == "EPH", 1, 0)]
+#eph <- eph[, .(iclass)]
+eph <- eph[, p := p_m5[,psum1]]
+cut1 <- cutpointr(eph,p,iclass,method = maximize_metric, metric=accuracy, pos_class=1, direction = ">=")
+c1 <- cut1$optimal_cutpoint
+
+int <- survData[, iclass := fifelse(SurvType == "EPH", 1, 
+                                   fifelse(SurvType == "INT", 1, 0))]
+int <- int[, .(iclass)]
+int <- int[, p := p_m5[, psum2]]
+cut2 <- cutpointr(int,p,iclass,method = maximize_metric,metric=accuracy,pos_class=1,direction=">=")
+c2 <- cut2$optimal_cutpoint
+
+trans <- survData[, iclass := fifelse(SurvType == "EPH", 1,
+                                      fifelse(SurvType == "INT", 1,
+                                              fifelse(SurvType == "TRANS", 1, 0)))]
+trans <- trans[, .(iclass)]
+trans <- trans[, p := p_m5[, psum3]]
+cut3 <- cutpointr(trans,p,iclass,method=maximize_metric,metric=accuracy,pos_class=1,direction=">=")
+c3 <- cut3$optimal_cutpoint
+
+smprm <- survData[, iclass := fifelse(SurvType == "EPH", 1,
+                                      fifelse(SurvType == "INT", 1,
+                                              fifelse(SurvType == "TRANS", 1, 
+                                                      fifelse(SurvType == "SMPRM", 1, 0))))]
+smprm <- smprm[, .(iclass)]
+smprm <- smprm[, p := p_m5[, psum4]]
+cut4 <- cutpointr(smprm,p,iclass,method=maximize_metric,metric=accuracy,pos_class=1,direction=">=")
+c4 <- cut4$optimal_cutpoint
+```
+
+Here are the cut points found for model 5:
+
+| Transition                         | Probability |
+|------------------------------------|-------------|
+| Ephemeral to Intermittent          | `r c1`      |
+| Intermittent to Transitional       | `r c2`      |
+| Transitional to Small Permanent    | `r c3`      |
+| Small Permanent to Large Permanent | `r c4`      |
+
+: Probability cut points for channel-class transitions, model 5.
+
+Here is the confusion matrix.
+
+```{r}
+p_m5 <- p_m5[, p1 := EPH]
+p_m5 <- p_m5[, p2 := EPH + INT]
+p_m5 <- p_m5[, p3 := EPH + INT + TRANS]
+p_m5 <- p_m5[, p4 := EPH + INT + TRANS + SMPRM]
+p_5 <- p_m5[, class := ifelse(p1 >= c1, 1,
+                               ifelse(p2 >= c2, 2,
+                                      ifelse(p3 >= c3, 3,
+                                             ifelse(p4 >= c4, 4, 5))))]
+
+p_5 <- factor(p_m5$class, levels = c(1,2,3,4,5))
+
+cm5cut <- confusionMatrix(p_5,d_class)
+tm5 <- as.data.table(cm5cut$table)
+n1 <- tm5[Reference==1, sum(N)]
+n2 <- tm5[Reference==2, sum(N)]
+n3 <- tm5[Reference==3, sum(N)]
+n4 <- tm5[Reference==4, sum(N)]
+n5 <- tm5[Reference==5, sum(N)]
+tmp <- tm5[, P := (fifelse(Reference==1, N/n1, fifelse(Reference==2, N/n2, fifelse(Reference==3, N/n3, ifelse(Reference==4, N/n4, ifelse(Reference==5, N/n5, 0))))))]
+```
+
+| Prediction      |  Ephemeral   | Intermittent  | Transitional  | Small Permanent | Large Permanent |
+|:-----------|:----------:|:----------:|:----------:|:----------:|:----------:|
+| Ephemeral       | `r tmp[1,4]` | `r tmp[6,4]`  | `r tmp[11,4]` |  `r tmp[16,4]`  |  `r tmp[21,4]`  |
+| Intermittent    | `r tmp[2,4]` | `r tmp[7,4]`  | `r tmp[12,4]` |  `r tmp[17,4]`  |  `r tmp[22,4]`  |
+| Transitional    | `r tmp[3,4]` | `r tmp[8,4]`  | `r tmp[13,4]` |  `r tmp[18,4]`  |  `r tmp[23,4]`  |
+| Small Permanent | `r tmp[4,4]` | `r tmp[9,4]`  | `r tmp[14,4]` |  `r tmp[19,4]`  |  `r tmp[24,4]`  |
+| Large Permanent | `r tmp[5,4]` | `r tmp[10,4]` | `r tmp[15,4]` |  `r tmp[20,4]`  |  `r tmp[25,4]`  |
+
+: Confusion matrix by proportion of each class, model 5 with cut points.
+
+```{r}
+# Separate data to EPH and all others.
+setnames(p_m6, c("EPH", "INT", "TRANS", "SMPRM", "LGPRM"))
+p_m6 <- p_m6[, psum1 := EPH]
+p_m6 <- p_m6[, psum2 := psum1 + INT]
+p_m6 <- p_m6[, psum3 := psum2 + TRANS]
+p_m6 <- p_m6[, psum4 := psum3 + SMPRM]
+
+eph <- survData[, iclass := fifelse(SurvType == "EPH", 1, 0)]
+#eph <- eph[, .(iclass)]
+eph <- eph[, p := p_m6[,psum1]]
+cut1 <- cutpointr(eph,p,iclass,method = maximize_metric, metric=accuracy, pos_class=1, direction = ">=")
+c1 <- cut1$optimal_cutpoint
+
+int <- survData[, iclass := fifelse(SurvType == "EPH", 1, 
+                                   fifelse(SurvType == "INT", 1, 0))]
+int <- int[, .(iclass)]
+int <- int[, p := p_m6[, psum2]]
+cut2 <- cutpointr(int,p,iclass,method = maximize_metric,metric=accuracy,pos_class=1,direction=">=")
+c2 <- cut2$optimal_cutpoint
+
+trans <- survData[, iclass := fifelse(SurvType == "EPH", 1,
+                                      fifelse(SurvType == "INT", 1,
+                                              fifelse(SurvType == "TRANS", 1, 0)))]
+trans <- trans[, .(iclass)]
+trans <- trans[, p := p_m6[, psum3]]
+cut3 <- cutpointr(trans,p,iclass,method=maximize_metric,metric=accuracy,pos_class=1,direction=">=")
+c3 <- cut3$optimal_cutpoint
+
+smprm <- survData[, iclass := fifelse(SurvType == "EPH", 1,
+                                      fifelse(SurvType == "INT", 1,
+                                              fifelse(SurvType == "TRANS", 1, 
+                                                      fifelse(SurvType == "SMPRM", 1, 0))))]
+smprm <- smprm[, .(iclass)]
+smprm <- smprm[, p := p_m6[, psum4]]
+cut4 <- cutpointr(smprm,p,iclass,method=maximize_metric,metric=accuracy,pos_class=1,direction=">=")
+c4 <- cut4$optimal_cutpoint
+```
+
+Here are the cut points found for model 6:
+
+| Transition                         | Probability |
+|------------------------------------|-------------|
+| Ephemeral to Intermittent          | `r c1`      |
+| Intermittent to Transitional       | `r c2`      |
+| Transitional to Small Permanent    | `r c3`      |
+| Small Permanent to Large Permanent | `r c4`      |
+
+: Probability cut points for channel-class transitions, model 5.
+
+Here is the confusion matrix.
+
+```{r}
+p_m6 <- p_m6[, p1 := EPH]
+p_m6 <- p_m6[, p2 := EPH + INT]
+p_m6 <- p_m6[, p3 := EPH + INT + TRANS]
+p_m6 <- p_m6[, p4 := EPH + INT + TRANS + SMPRM]
+p_6 <- p_m6[, class := ifelse(p1 >= c1, 1,
+                               ifelse(p2 >= c2, 2,
+                                      ifelse(p3 >= c3, 3,
+                                             ifelse(p4 >= c4, 4, 5))))]
+
+p_6 <- factor(p_m6$class, levels = c(1,2,3,4,5))
+
+cm6cut <- confusionMatrix(p_6,d_class)
+tm6 <- as.data.table(cm6cut$table)
+n1 <- tm6[Reference==1, sum(N)]
+n2 <- tm6[Reference==2, sum(N)]
+n3 <- tm6[Reference==3, sum(N)]
+n4 <- tm6[Reference==4, sum(N)]
+n5 <- tm6[Reference==5, sum(N)]
+tmp <- tm6[, P := (fifelse(Reference==1, N/n1, fifelse(Reference==2, N/n2, fifelse(Reference==3, N/n3, ifelse(Reference==4, N/n4, ifelse(Reference==5, N/n5, 0))))))]
+```
+
+| Prediction      |  Ephemeral   | Intermittent  | Transitional  | Small Permanent | Large Permanent |
+|:-----------|:----------:|:----------:|:----------:|:----------:|:----------:|
+| Ephemeral       | `r tmp[1,4]` | `r tmp[6,4]`  | `r tmp[11,4]` |  `r tmp[16,4]`  |  `r tmp[21,4]`  |
+| Intermittent    | `r tmp[2,4]` | `r tmp[7,4]`  | `r tmp[12,4]` |  `r tmp[17,4]`  |  `r tmp[22,4]`  |
+| Transitional    | `r tmp[3,4]` | `r tmp[8,4]`  | `r tmp[13,4]` |  `r tmp[18,4]`  |  `r tmp[23,4]`  |
+| Small Permanent | `r tmp[4,4]` | `r tmp[9,4]`  | `r tmp[14,4]` |  `r tmp[19,4]`  |  `r tmp[24,4]`  |
+| Large Permanent | `r tmp[5,4]` | `r tmp[10,4]` | `r tmp[15,4]` |  `r tmp[20,4]`  |  `r tmp[25,4]`  |
+
+: Confusion matrix by proportion of each class, model 5 with cut points.
+
+Note that, using cut points, model 1 with a linear relationship between the log-odds of being in any class and the logarithm of contributing area produces exactly the same model performance using a nonlinear relationship.
+
+```{r}
+cm1$byClass[,11]
+cm2$byClass[,11]
+cm3$byClass[,11]
+cm4$byClass[,11]
+cm5$byClass[,11]
+cm6$byClass[,11]
+cm1cut$byClass[,11]
+cm2cut$byClass[,11]
+cm3cut$byClass[,11]
+cm4cut$byClass[,11]
+cm5cut$byClass[,11]
+cm6cut$byClass[,11]
+```
+
+```{r}
+cm1$byClass[,1]
+cm2$byClass[,1]
+cm3$byClass[,1]
+cm4$byClass[,1]
+cm5$byClass[,1]
+cm6$byClass[,1]
+cm1cut$byClass[,1]
+cm2cut$byClass[,1]
+cm3cut$byClass[,1]
+cm4cut$byClass[,1]
+cm5cut$byClass[,1]
+cm6cut$byClass[,1]
+```
+
+
+```{r}
+cm1$byClass[,5]
+cm2$byClass[,5]
+cm3$byClass[,5]
+cm4$byClass[,5]
+cm5$byClass[,5]
+cm6$byClass[,5]
+cm1cut$byClass[,5]
+cm2cut$byClass[,5]
+cm3cut$byClass[,5]
+cm4cut$byClass[,5]
+cm5cut$byClass[,5]
+cm6cut$byClass[,5]
+```
