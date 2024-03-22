@@ -1,0 +1,103 @@
+---
+title: "DEM alignment"
+author: "Dan Miller"
+format: 
+  html:
+    code-fold: true
+    toc: true
+    number-sections: true
+editor: visual
+---
+
+# DEM Coregistration
+
+In the study design we described a tentative workflow for lidar differencing:
+
+1.  Create a DoD with the existing DTMs available on the Lidar Portal. Use these to delineate stable areas where the elevation difference is spatially consistent and small.
+
+2.  Filter point clouds to identify ground returns, the appropriate filtering algorithm will need to be determined; identify and remove outliers. This will provide a consistent method for creation of all DTMs.
+
+3.  Use ICP over a mesh defined on the stable zones to co-register the two point clouds, with mesh size determined by the ground-return density and using the highest quality of the two lidar acquisition (generally the newer one) as the reference.
+
+4.  Interpolate each point cloud to a DTM. The appropriate interpolation algorithm will need to be determined.
+
+5.  Create a DoD from the two DTMs, or alternatively using the M3C2 algorithm but with a vertical measurement direction with control points over a regular grid.
+
+6.  Evaluate the DoD on a piece-wise basis to remove bias over the delineated stable zones .
+
+7.  Calculate *LOD* at 95% confidence using Equations 1 and 2 at each grid point over the DoD, with *e* estimated from the remaining DoD values over the delineated stable zones. This gives a spatially variable level of detection.
+
+8.  Use image segmentation of the DoD to delineate zones of elevation loss and gain. Filter these by topographic attributes (from the earlier, pre-landslide DTM) appropriate for landslide sites (e.g., slopes \> 40%), by the juxtaposition of upslope elevation loss and downslope elevation gain, and potentially by vegetation changes apparent from the two DSMs and from NAIP or other imagery aligned with the lidar acquisition dates. This provides a starting point for object-based image analysis to delineate landslide sites and runout zones.
+
+I'd like to experiment with a shorter workflow that might be somewhat more efficient and still adequately meet our needs. The Lidar Portal provides existing DTMs made from laser reflections interpreted as lidar ground returns. These have probably not been made in a consistent manner: different algorithms were probably used to filter ground returns from the point cloud and different interpolation schemes used to generate the DTM grid from the ground returns. Steps 2, 3, and 4 above are intended to generate DTMs using consistent methods. Perhaps, so that we can progress a bit quicker given our already delinquent timeline, we could use the existing DTMs from the Lidar Portal, skip steps 2, 3, and 4; in step 5 create a DoD using the existing DTMs, and then add one, or possibly two, tasks to step 6. These are:
+
+1.  [Optimize the DTM for low ground returns]{.underline}. This involves adjusting DTM point elevations to eliminate any ground returns with elevation below the DTM. Find all ground returns that fall below the interpolated DTM elevation and adjust the DTM grid points at the corners of the cell that contain the points so that no ground returns fall below the DTM. The reasoning is that those lowest points are the reflections closest to the ground; returns with elevation above the DTM may be from vegetation.
+
+2.  [Coregister DTMs.]{.underline} Divide the most recent DTM into a series of overlapping tiles. For each tile, find the x, y, z displacement that minimizes the elevation difference with the other DTM. These shifts are determined only for DTM points where the initial elevation difference is less than some specified threshold to avoid using actual changes between the DTMs when calculating the shift. The tile dimensions need to be sufficiently large to include hillslopes over a range of aspects so that horizontal shifts can be properly determined. This procedure might be iterated until the change in elevation difference between the DTMs within the tile are minimized.
+
+Proposed methods.
+
+## Optimize the DTM for low ground returns.
+
+Here's an image showing ground-return elevations relative to a DTM interpolated from the same ground returns.
+
+![Ground return elevation relative to interpolated DTM elevation.](GroundReturns.jpg){fig-align="center" width="6in"}
+
+The DTM was interpolated to a 1-meter horizontal-resolution grid[^1]. Ground-return points falling within 5 centimeters of the DTM elevation are not shown. Those more than that above the DTM are in blue; those more than that below the DTM are in yellow to red. This area is densely vegetated, so it is likely that many ground returns are actually reflections from vegetation. If that is the case, it makes sense to give those points below the DTM surface a greater weight in the interpolation scheme; we want to match the actual ground surface as closely as possible. Note that the points below the DTM with the largest elevation difference tend to be clumped most densely along stream channels and that steeper slopes have a higher density of both above- and below-the-DTM points. We want an algorithm to adjust DTM grid-point elevations so that fewer, or none, of the classified ground returns lie below the interpolated DTM surface but that alters the DTM as little as possible.
+
+[^1]: This example is from new very-high density lidar for another project, for which I happened to have this image.
+
+Elevations within a DTM cell are interpolated from the cell-corner grid-point elevations using [bilinear interpolation](https://en.wikipedia.org/wiki/Bilinear_interpolation). We could use higher-order interpolation schemes (e.g., bicubic interpolation) that might better match curved surfaces but that can also produce elevations that fall outside the range of those at the cell corners and are, therefore, more sensitive to noise in the DTM. Anyway, for a high-resolution DTM with horizontal grid-point spacing of a meter or so, bilinear interpolation should adequately represent the ground surface for our needs. Here is a possible strategy for adjusting DTM elevations:
+
+1.  Find all ground returns that fall below the DTM surface and rank these from the largest to smallest magnitude.
+
+2.  Starting with the largest-magnitude point, that with the greatest elevation difference from the DTM, adjust the four DTM points on the corner of the cell that contains the point so that the interpolated DTM surface intersects the point.
+
+3.  Then go to the next largest-magnitude point in the list. If the point falls within a cell for which any corners have already been adjusted, recalculate the elevation difference and re-position the point in the list or remove it if it no longer falls below the DTM; otherwise adjust it's cell corners. Repeat until all points in the list have been dealt with.
+
+Here is a strategy for adjusting the cell corners. For the ground-return point, calculate the derivative of elevation difference $\Delta e$ as a function of each cell-corner elevation $z$ ($d\Delta e/dz$) and define the sum:
+
+$$
+\frac{d\Delta e}{dz_1} \Delta z_1 + \frac{d\Delta e}{dz_2} \Delta z_2 + \frac{d\Delta e}{dz_3} \Delta z_3 + \frac{d \Delta e}{\Delta z_4} \Delta z_4 = \Delta e
+$$ {#eq-delta-e}
+
+![DTM cell defined by four corner grid points.](images/clipboard-1263117997.png){width="4.15in"}
+
+We can calculate the derivatives exactly based on the position of the point in the cell. Given those, we want to find the smallest $\Delta z$s that satisfy this equation. One approach is to make each $\Delta z$ proportional to the relative magnitude of its associated derivative. As a shorthand, I'll label each derivative as $d_1 = {d\Delta e}/{dz_1}$, etc. Then the relative magnitude of the derivative for the i^th^ corner is $d_i / \sum d$. With this, rewrite @eq-delta-e as:
+
+$$
+d_1 (\frac{d_1}{\sum d}\Delta z) + d_2(\frac{d_2}{\sum d}\Delta z) + d_3(\frac{d_3}{\sum d}\Delta z) + d_4(\frac{d_4}{\sum d}\Delta z) = \Delta e
+$$
+
+where $\frac{d_1}{\sum d}\Delta z = \Delta z_1$, etc. Solving for $\Delta z$ gives:
+
+$$
+\Delta z = \frac{\Delta e \sum d}{\sum d^2}.
+$$
+
+This algorithm provides a means of adjusting the DTM to remove ground returns falling below the interpolated DTM surface while minimizing changes to the DTM. I have not actually coded this and tried it, so it remains to be seen how well it works, but this is the plan. The hope is that this will provide a DTM that better resolves ground-surface features.
+
+## Coregistration
+
+Here is an example of how coregistratin might help. Figure @fig-elev-dif shows the elevation difference between lidar taken in 2006, before the 2007 storm, and in 2017. I've plotted apparent elevation loss over that time in yellow to red, elevation gain in light to dark blue.
+
+![Elevation difference (m), 2006 to 2017. Negative values represent elevation loss.](images/clipboard-1306973416.png){#fig-elev-dif}
+
+Note how northwest-aspect slopes tend to show an elevation loss and southeast-aspect slopes tend to show an elevation gain. These differences tend to be mostly 2 meters or less, whereas landslides mapped after the 2007 storm show elevation losses of several meters. This aspect-dependent elevation difference suggests that the two DTMs are shifted horizontally from one another. Consider a 70% slope: a horizontal offset of one meter results in a vertical mismatch of 0.7 meters. We want to find the x-y shift that minimizes these differences. Even after the horizontal shift is made, there may still be a systematic vertical difference to account for. Additionally, these shifts might vary in magnitude across the DTMs. Here is a proposed method to find the x-y-z shift for one of the DTMs to minimize elevation differences in those zones where no elevation change is warranted.
+
+For this example, hold the 2006 DTM stationary and shift the 2017 DTM. To start, the DTM cell corners do not match for these DTMs: they are offset about 4 cm in y and 15 cm in x. We can leave that as is for now. For each point in the 2017 DTM, we are looking for shifts $\Delta x, \Delta y$ and $\Delta z$ that bring the point in alignment with the 2006 DTM elevation. For a single point, we can do that with $\Delta z$ alone; we want to find the $\Delta x, \Delta y$ and $\Delta z$ to apply over an entire section of the DTM that will minimize $\sum{\Delta e}$ over all points in that section. We can use partial derivatives of each $\Delta e$ to find the optimal values of $\Delta x, \Delta y$ and $\Delta z$. For the *i*^th^ DTM point:\
+$$
+\frac{\partial{\Delta e_i}}{\partial{x_i}}\Delta x + \frac{\partial{\Delta e_i}}{\partial{y_i}}\Delta y + \frac{\partial{\Delta e_i}}{\partial{z_i}}\Delta z = \Delta e_i
+$$ {#eq-shifts}
+
+For $n$ points, this gives $n$ equations. We want the solution for $\Delta x, \Delta y$ and $\Delta z$ that minimizes $\sum_{i=1}^{n} \Delta e_i$. We can write @eq-shifts in matrix form: $\textbf{Ax} = \textbf{e}$, where $\textbf{A}$ is an n by 3 matrix with each row containing the three partial derivatives for point i, $\textbf{x}$ is the vector of $\Delta x, \Delta y$ and $\Delta z$, and $\textbf{e}$ is a vector of length $n$ containing all the $\Delta e$s. We can invert $\textbf{A}$ to obtain on optimal solution for $\textbf{x}$ using [singular value decomposition](https://en.wikipedia.org/wiki/Singular_value_decomposition).
+
+Recall that we do not want to include $\Delta e$ values where legitimate elevation changes have occurred. A simple way to preclude those points is to specify a threshold of absolute change and only include points with a $\Delta e$ value less than that threshold.
+
+We could perform the calculation over the entire overlapping portions of the DTMs, but we also want to account for spatial variation in the amount of offset between the DTMs. To do that, we can divide the DTMs into a set of overlapping tiles. Each tile must be large enough to include the full range of slope aspects, otherwise a simple vertical shift would work for the tile. We can find the optimal shifts for each tile, then interpolate from the tile center points to specify the shift for each DTM point.
+
+Also recall, the two DTM cell corners do not line up exactly, even though they have the same cell dimensions (0.9144 meters). To get $\Delta e$ for any point, we need to interpolate the 2006 DTM elevation at the 2017 DTM grid point. We can calculate the partial derivatives numerically by calculating the change in $\Delta e$ associated with small x, y, and z shifts (the z derivative is easy) or analytically with a bit of algebra.
+
+We can impose a limit on the maximum shift, say no more than one DTM cell width. We might need to iterate this procedure a time or two then to find the final shift values that minimize $\sum{\Delta e}$.
+
+I will code these up, in Fortran for now because I have underlying code that simplifies this compared to figuring out how to implement it in python. Then to work on a scheme for calculating confidence intervals for the $\Delta e$s, which I'll work on after determining if these schemes work.
