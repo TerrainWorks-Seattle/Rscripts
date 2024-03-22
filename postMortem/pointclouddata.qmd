@@ -1,0 +1,82 @@
+---
+title: "Point Cloud"
+author: "Dan Miller"
+date: "3/5/2024"
+format: 
+  html:
+    code-fold: true
+editor: visual
+---
+
+Tasks:
+
+1.  Assemble point clouds. This involves several subtasks:\
+    a) Create a LAScatalog for each data set. This provides a polygon shapefile showing all las tile locations.\
+    b) Create a lidR las object for the area of interest. \
+    c) Classify ground and water returns (or rely on existing classifications). Potentially filter outliers. Need to come up with an algorithm for that.\
+    c) Las objects include X, Y, and Z data fields. After the points have been classified and filtered, export ground and water returns to a data.table object. Washington state data are in state plane U.S. survey feet. Convert everything to meters. Note that US survey feet are 0.3048006096012192 meters in length.
+
+2.  Generate DTMs from the point clouds (or use the one downloaded from the portal?). Use tin interpolation. Horizontal cell resolution of 1 meter (?).
+
+3.  Code to enforce locally low ground points. See DEM Alignment. However, use a slightly different algorithm. Rank ground returns by elevation below the interpolated DTM surface and create an array with elevation difference and DTM column and row. Starting with the point having the largest-magnitude elevation difference, find the nearest DTM grid point and set its elevation to the ground-return elevation. March through all the points.
+
+4.  Code to align DTMs as described in DEM Alignment.
+
+5.  Try Iterative-Closest-Point algorithm as well, generate DTMs from the resulting shifted point clouds, and compare to results from step 4.
+
+6.  Find landslides
+
+```{r}
+#| echo: false
+library(data.table)
+library(lidR)
+library(raster)
+library(sf)
+library(terra)
+library(ggplot2)
+```
+
+Read in the 2006 Lewis acquisition as a las catalog and export the tile locations to a polygon shapefile.
+
+```{r}
+path <- "c:/work/data/postmortem/"
+
+lewis_2006 <- readLAScatalog(paste0(path, "lewis_2006/laz"), overwrite = TRUE) 
+st_write(st_as_sf(lewis_2006), paste0(path, "lewis_2006/tilepoly.shp"), append = FALSE)
+
+swwa_2017 <- readLAScatalog(paste0(path, "swwa_foothills_2017/laz"), overwrite = TRUE)
+st_write(st_as_sf(swwa_2017), paste0(path, "swwa_foothills_2017/tilepoly.shp"), append = FALSE)
+
+opsw_2019 <- readLAScatalog(paste0(path, "southwest_wa_opsw_2019/laz"), overwrite = TRUE)
+st_write(st_as_sf(opsw_2019), paste0(path, "southwest_wa_opsw_2019/tilepoly.shp"), append = FALSE)
+```
+
+Clip out a region of interest:
+```{r}
+l1_all <- lidR::clip_rectangle(pm, 970040, 432790, 977021, 439322) 
+lidR::filter_duplicates(l1_all)
+l1_ground <- filter_poi(l1_all, Classification == 2L | Classification == 9L) # keep ground returns and water
+```
+
+This will export the x, y, z values to a csv file and convert everything to meters (I hope)
+
+```{r}
+xyz <- as.data.table(xyz)
+xyz <- xyz[,.(l1_ground$X, l1_ground$Y, l1_ground$Z)]
+xyz <- xyz[, .(X=V1*0.3048006096012192, Y=V2*0.3048006096012192, Z = V3*0.3048006096012192)]
+write.csv(xyz,'c:/temp/lo.csv')
+```
+
+The laz files from the lidar portal are in StatePlane US feet. I haven't figured out how to convert a spatraster from feet to meters in the horizontal units, so that will need to happen with subsequent processing.
+
+```{r}
+# This produces a DTM using tin interpolation with 1-meter cell size
+dtm <- lidR::rasterize_terrain(l1_all, res=3.28083333333333335958, algorithm = tin(), pkg="terra")
+
+# This gives point density in points per square foot
+den <- lidR::rasterize_density(l1_ground, res=3.28083333333333335958)
+den <- den * 10.76386736 # convert to points per cell
+
+writeRaster(dtm, "c:/temp/dtm.tif", overwrite=TRUE)
+writeRaster(den, "c:/temp/pntden.tif", overwrite=TRUE)
+```
