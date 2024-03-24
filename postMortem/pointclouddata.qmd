@@ -1,7 +1,7 @@
 ---
 title: "Point Cloud"
 author: "Dan Miller"
-date: "3/5/2024"
+date: "`r Sys.Date()`"
 format: 
   html:
     code-fold: true
@@ -11,10 +11,11 @@ editor: visual
 Tasks:
 
 1.  Assemble point clouds. This involves several subtasks:\
-    a) Create a LAScatalog for each data set. This provides a polygon shapefile showing all las tile locations.\
-    b) Create a lidR las object for the area of interest. \
-    c) Classify ground and water returns (or rely on existing classifications). Potentially filter outliers. Need to come up with an algorithm for that.\
-    c) Las objects include X, Y, and Z data fields. After the points have been classified and filtered, export ground and water returns to a data.table object. Washington state data are in state plane U.S. survey feet. Convert everything to meters. Note that US survey feet are 0.3048006096012192 meters in length.
+
+    a)  Create a LAScatalog for each data set. This provides a polygon shapefile showing all las tile locations.\
+    b)  Create a lidR las object for the area of interest.\
+    c)  Classify ground and water returns (or rely on existing classifications). Potentially filter outliers. Need to come up with an algorithm for that.\
+    d)  Las objects include X, Y, and Z data fields. After the points have been classified and filtered, export ground and water returns to a data.table object. Washington state data are in state plane U.S. survey feet. Convert everything to meters. Note that US survey feet are 0.3048006096012192 meters in length.
 
 2.  Generate DTMs from the point clouds (or use the one downloaded from the portal?). Use tin interpolation. Horizontal cell resolution of 1 meter (?).
 
@@ -34,6 +35,7 @@ library(raster)
 library(sf)
 library(terra)
 library(ggplot2)
+library(qgisprocess)
 ```
 
 Read in the 2006 Lewis acquisition as a las catalog and export the tile locations to a polygon shapefile.
@@ -41,42 +43,96 @@ Read in the 2006 Lewis acquisition as a las catalog and export the tile location
 ```{r}
 path <- "c:/work/data/postmortem/"
 
-lewis_2006 <- readLAScatalog(paste0(path, "lewis_2006/laz"), overwrite = TRUE) 
-st_write(st_as_sf(lewis_2006), paste0(path, "lewis_2006/tilepoly.shp"), append = FALSE)
+datafile <- paste0(path, "lewis_2006/tilepoly.shp")
+if (!file.exists(datafile)) {
+  lewis_2006 <- readLAScatalog(paste0(path, "lewis_2006/laz")) 
+  st_write(st_as_sf(lewis_2006), datafile, append = FALSE)
+}
 
-swwa_2017 <- readLAScatalog(paste0(path, "swwa_foothills_2017/laz"), overwrite = TRUE)
-st_write(st_as_sf(swwa_2017), paste0(path, "swwa_foothills_2017/tilepoly.shp"), append = FALSE)
+datafile <- paste0(path, "swwa_foothills_2017/tilepoly.shp")
+if (!file.exists(datafile)) {
+  swwa_2017 <- readLAScatalog(paste0(path, "swwa_foothills_2017/laz"))
+  st_write(st_as_sf(swwa_2017), datafile, append = FALSE)
+}
 
-opsw_2019 <- readLAScatalog(paste0(path, "southwest_wa_opsw_2019/laz"), overwrite = TRUE)
-st_write(st_as_sf(opsw_2019), paste0(path, "southwest_wa_opsw_2019/tilepoly.shp"), append = FALSE)
+datafile <- paste0(path, "southwest_wa_opsw_2019/tilepoly.shp")
+if (!file.exists(datafile)) {
+  opsw_2019 <- readLAScatalog(paste0(path, "southwest_wa_opsw_2019/laz"))
+  st_write(st_as_sf(opsw_2019), datafile, append = FALSE)
+}
 ```
 
 Clip out a region of interest:
-```{r}
-l1_all <- lidR::clip_rectangle(pm, 970040, 432790, 977021, 439322) 
-lidR::filter_duplicates(l1_all)
-l1_ground <- filter_poi(l1_all, Classification == 2L | Classification == 9L) # keep ground returns and water
-```
-
-This will export the x, y, z values to a csv file and convert everything to meters (I hope)
 
 ```{r}
-xyz <- as.data.table(xyz)
-xyz <- xyz[,.(l1_ground$X, l1_ground$Y, l1_ground$Z)]
-xyz <- xyz[, .(X=V1*0.3048006096012192, Y=V2*0.3048006096012192, Z = V3*0.3048006096012192)]
-write.csv(xyz,'c:/temp/lo.csv')
+datafile <- paste0(path, "box.shp")
+box <- st_read(datafile)
+
+all_2006 <- lidR::clip_roi(lewis_2006, box) 
+lidR::filter_duplicates(all_2006)
+ground_2006 <- filter_poi(all_2006, Classification == 2L | Classification == 9L) # keep ground returns and water
+
+all_2017 <- lidR::clip_roi(swwa_2017, box) 
+lidR::filter_duplicates(all_2017)
+ground_2017 <- filter_poi(all_2017, Classification == 2L | Classification == 9L)
+
+all_2019 <- lidR::clip_roi(opsw_2019, box) 
+lidR::filter_duplicates(all_2019)
+ground_2019 <- filter_poi(all_2019, Classification == 2L | Classification == 9L)
 ```
 
 The laz files from the lidar portal are in StatePlane US feet. I haven't figured out how to convert a spatraster from feet to meters in the horizontal units, so that will need to happen with subsequent processing.
 
 ```{r}
 # This produces a DTM using tin interpolation with 1-meter cell size
-dtm <- lidR::rasterize_terrain(l1_all, res=3.28083333333333335958, algorithm = tin(), pkg="terra")
+dtm_2006 <- lidR::rasterize_terrain(ground_2006, res=3.28083333333333335958, algorithm = tin(), pkg="terra")
 
 # This gives point density in points per square foot
-den <- lidR::rasterize_density(l1_ground, res=3.28083333333333335958)
-den <- den * 10.76386736 # convert to points per cell
+den_2006 <- lidR::rasterize_density(ground_2006, res=3.28083333333333335958)
+den_2006 <- den_2006 * 10.76386736 # convert to points per cell
 
-writeRaster(dtm, "c:/temp/dtm.tif", overwrite=TRUE)
-writeRaster(den, "c:/temp/pntden.tif", overwrite=TRUE)
+writeRaster(dtm_2006, paste0(path, "dtm_2006.tif"), overwrite=TRUE)
+writeRaster(den_2006, paste0(path, "den_2006.tif"), overwrite=TRUE)
+
+dtm_2017 <- lidR::rasterize_terrain(ground_2017, res=3.28083333333333335958, algorithm = tin(), pkg="terra")
+
+# This gives point density in points per square foot
+den_2017 <- lidR::rasterize_density(ground_2017, res=3.28083333333333335958)
+den_2017 <- den_2017 * 10.76386736 # convert to points per cell
+
+writeRaster(dtm_2017, paste0(path, "dtm_2017.tif"), overwrite=TRUE)
+writeRaster(den_2017, paste0(path, "den_2017.tif"), overwrite=TRUE)
+
+dtm_2019 <- lidR::rasterize_terrain(ground_2019, res=3.28083333333333335958, algorithm = tin(), pkg="terra")
+
+# This gives point density in points per square foot
+den_2019 <- lidR::rasterize_density(ground_2019, res=3.28083333333333335958)
+den_2019 <- den_2019 * 10.76386736 # convert to points per cell
+
+writeRaster(dtm_2019, paste0(path, "dtm_2019.tif"), overwrite=TRUE)
+writeRaster(den_2019, paste0(path, "den_2019.tif"), overwrite=TRUE)
 ```
+
+This will export the x, y, z values to a csv file and convert everything to meters (I hope)
+
+```{r}
+xyz_2006 <- as.data.table(list(ground_2006$X, ground_2006$Y, ground_2006$Z))
+xyz_2006 <- xyz_2006[, .(X=V1*0.3048006096012192, Y=V2*0.3048006096012192, Z = V3*0.3048006096012192)]
+write.csv(xyz_2006,paste0(path, "xyz_2006.csv"))
+
+xyz_2017 <- as.data.table(list(ground_2017$X, ground_2017$Y, ground_2017$Z))
+xyz_2017 <- xyz_2017[, .(X=V1*0.3048006096012192, Y=V2*0.3048006096012192, Z = V3*0.3048006096012192)]
+write.csv(xyz_2017,paste0(path, "xyz_2017.csv"))
+
+xyz_2019 <- as.data.table(list(ground_2019$X, ground_2019$Y, ground_2019$Z))
+xyz_2019 <- xyz_2019[, .(X=V1*0.3048006096012192, Y=V2*0.3048006096012192, Z = V3*0.3048006096012192)]
+write.csv(xyz_2019,paste0(path, "xyz_2019.csv"))
+```
+
+The align.exe fortran code appears to work as intended. An interesting result: the DTMs constructed using lidR from the point clouds in the code chunks above align more closely than the DTMs downloaded from the lidar portal. The plan, maybe:
+
+1.  Identify overlapping laz tiles from the 2006, 2017, and 2019 lidar that are within post-mortem cluster polygons, build las catalogs, and clip out an area of interest, and build DTMs for each lidar acquisition. Have the DTMs align exactly by x, y corners and cellsize.
+
+2.  Modify align.exe to divide the DTM into a set of overlapping tiles of specified size. Find dx, dy, dz for each tile. Assign those shifts to the tile midpoint. Once shifts are found for all tiles, interpolate to get a dx, dy, dz for each DTM grid point and each ground return. Use the shifted ground returns to build a new DTM.
+
+3.  Create a difference raster.
