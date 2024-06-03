@@ -65,7 +65,7 @@ if (!file.exists(datafile)) {
 Clip out a region of interest:
 
 ```{r}
-datafile <- paste0(path, "box.shp")
+datafile <- paste0(path, "cluster_1SP.shp")
 box <- st_read(datafile)
 
 all_2006 <- lidR::clip_roi(lewis_2006, box) 
@@ -88,29 +88,29 @@ The laz files from the lidar portal are in StatePlane US feet. I haven't figured
 dtm_2006 <- lidR::rasterize_terrain(ground_2006, res=3.28083333333333335958, algorithm = tin(), pkg="terra")
 
 # This gives point density in points per square foot
-den_2006 <- lidR::rasterize_density(ground_2006, res=3.28083333333333335958)
-den_2006 <- den_2006 * 10.76386736 # convert to points per cell
+#den_2006 <- lidR::rasterize_density(ground_2006, res=3.28083333333333335958)
+#den_2006 <- den_2006 * 10.76386736 # convert to points per cell
 
 writeRaster(dtm_2006, paste0(path, "dtm_2006.tif"), overwrite=TRUE)
-writeRaster(den_2006, paste0(path, "den_2006.tif"), overwrite=TRUE)
+#writeRaster(den_2006, paste0(path, "den_2006.tif"), overwrite=TRUE)
 
 dtm_2017 <- lidR::rasterize_terrain(ground_2017, res=3.28083333333333335958, algorithm = tin(), pkg="terra")
 
 # This gives point density in points per square foot
-den_2017 <- lidR::rasterize_density(ground_2017, res=3.28083333333333335958)
-den_2017 <- den_2017 * 10.76386736 # convert to points per cell
+#den_2017 <- lidR::rasterize_density(ground_2017, res=3.28083333333333335958)
+#den_2017 <- den_2017 * 10.76386736 # convert to points per cell
 
 writeRaster(dtm_2017, paste0(path, "dtm_2017.tif"), overwrite=TRUE)
-writeRaster(den_2017, paste0(path, "den_2017.tif"), overwrite=TRUE)
+#writeRaster(den_2017, paste0(path, "den_2017.tif"), overwrite=TRUE)
 
-dtm_2019 <- lidR::rasterize_terrain(ground_2019, res=3.28083333333333335958, algorithm = tin(), pkg="terra")
+#dtm_2019 <- lidR::rasterize_terrain(ground_2019, res=3.28083333333333335958, algorithm = tin(), pkg="terra")
 
 # This gives point density in points per square foot
-den_2019 <- lidR::rasterize_density(ground_2019, res=3.28083333333333335958)
-den_2019 <- den_2019 * 10.76386736 # convert to points per cell
+#den_2019 <- lidR::rasterize_density(ground_2019, res=3.28083333333333335958)
+#den_2019 <- den_2019 * 10.76386736 # convert to points per cell
 
-writeRaster(dtm_2019, paste0(path, "dtm_2019.tif"), overwrite=TRUE)
-writeRaster(den_2019, paste0(path, "den_2019.tif"), overwrite=TRUE)
+#writeRaster(dtm_2019, paste0(path, "dtm_2019.tif"), overwrite=TRUE)
+#writeRaster(den_2019, paste0(path, "den_2019.tif"), overwrite=TRUE)
 ```
 
 This will export the x, y, z values to a csv file and convert everything to meters (I hope)
