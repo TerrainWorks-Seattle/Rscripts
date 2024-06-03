@@ -1,0 +1,78 @@
+---
+title: "Elevation Derivatives"
+format: pdf
+editor: visual
+bibliography: references.bib
+---
+
+## Elevation Derivatives
+
+First and second derivatives of ground-surface elevation are indicative of the velocity and convergence of water flowing over the ground surface and through the soil [see @minár2020 for a thorough discussion]. For identifying landforms conducive to wetland development, these derivatives can be indicative of the potential for water accumulation. These landforms span a heirarchical range of spatial scales. Low-lying areas spanning hundreds of meters may contain local high and low points spanning tens of meters that together determine where wetlands are likely to form. We need methods for calculating these derivatives over this range of length scales.
+
+Our elevation data, provided as digital elevation models (DEMs, also called digital terrain models, DTMs), consists of regular grids of elevation values [see @wilson2012 for an overview of terrain modeling using DEMs]. These values are interpolated from a variety of data sources; lidar ground-returns for example. Two methods are used to calculate derivatives using these gridded values: 1) finite differencing, which uses the difference in elevation between adjacent grid points, and 2) fitting of a smooth surface to a set of grid points and using the derivatives of that fit surface. Both methods are typically applied over a set of adjacent grid points so that gradient (first derivative) can be calculated over one cell width (2 grid points) and curvatures (second derivatives) over two cell widths (3 grid points) using finite differencing and over a 3x3 grid-point window when fitting a smooth (typically polynomial) surface.
+
+To estimate derivatives over larger length scales a smooth surface can be fit to DEM points over a larger window. The fit surface will not necessarily intersect all the elevation points, but differences between those points and the surface can be minimized. The computational load, however, increases with the square of window size, so this method becomes prohibitively slow for large window sizes. An alternative is to fit a surface to a subset of points within the window, as done for calculating aspect and gradient in the [MultiscaleDTM](https://cran.r-project.org/web/packages/MultiscaleDTM/index.html) R package [@ilich2023]. Ilich et al. use a rectangular window (see their Figure 5); following an example in [@shi2007], I've used a circular window. The surface is fit to nine elevation points, as described by [@zevenbergen1987] for a rectangular window. (Note that Shi et al.'s equations translating the Lagrange Polynomial presented by Zevenbergen and Thorne have some errors, so best to re-derive them yourself). Using Zevenbergen and Thorne's numbering scheme, the points are located on the circumference of a circle of radius $r$ as shown below, with point 5 being the focal point:
+
+![The center focal point and eight points on the circumference of a circle of radius r.](images/circle.PNG){width="3in"}
+
+The eight points on the circumference will not generally fall on DEM grid points; their elevation can be interpolated from the surrounding four points using [bilinear interpolation](https://www.r-bloggers.com/2024/01/extract-raster-values-to-points-with-bilinear-interpolation/) (terra::extract(, method="bilinear"). Using Zevenbergen and Thorne's nomenclature, here is the Fortran code I use. In Fortran, exclamation symbols indicate a comment. Fortran uses explicit typing; "dp" indicates a double-precision (8-byte) real.
+
+``` default
+! use Zevenbergen and Thorne nominclature, with Shi etal definitions 
+! (but use correct equations).
+
+CALL self%getXY(col,row,x0,y0) ! "self" is a DEM object;
+! I've adopted an object-oriented strategy, getXY is a method
+! to get the x-y location at column, row
+
+r = REAL(radius,dp) ! Fortran uses explicit typing
+
+! Get elevations
+DO
+  dx = REAL(r,dp) * delx 
+  dy = REAL(r,dp) * dely
+  ! delx and dely are arrays with the DEM ordinal and diagonal cell dimensions
+
+  DO i = 1,9
+    x1 = x0 + dx(i)
+    y1 = y0 + dy(i)
+    z(i) = REAL(self%value(x1,y1),dp) 
+    ! self%value() is a method to extract the raster value at x1, y1
+  END DO
+END DO
+! z(i) is a 9-element array of elevation values located as in the figure above
+
+z = z - z(5) ! center
+z = z/r ! normalize by radius
+
+! Zevenbergen and Thorne's nominclature
+A = (z(1)+z(3)+z(7)+z(9)) - (z(2)+z(4)+z(6)+z(8))
+B = ((z(1)+z(3)-z(7)-z(9))/SQRT2_DP) - (z(2)-z(8))
+C = ((-z(1)+z(3)-z(7)+z(9))/SQRT2_DP) + (z(4)-z(6))
+D = (z(4)+z(6))*0.5_dp ! note that z(5) is zero
+E = (z(2)+z(8))*0.5_dp
+F = (-z(1)+z(3)+z(7)-z(9))*0.5_dp
+G = (-z(4)+z(6))*0.5_dp
+H = (z(2)-z(8))*0.5_dp
+
+H2 = H*H
+G2 = G*G
+G2H2 = G2 + H2
+
+! Rotate 45 degrees
+Grot = (-z(1)+z(9))*0.5_dp
+Hrot = (z(3)-z(7))*0.5_dp
+
+! Calculate gradient N-S-E-W and NW-SE-NE-SW and take the mean
+! to reduce bias from grid orientation
+grad1 = SQRT(G2+H2)
+grad2 = SQRT(Grot*Grot+Hrot*Hrot)
+gradient = (grad1+grad2)*0.5_dp
+
+plan = 2._dp*(D*H2 + E*H2 + F*G*H)/(G2H2*r)
+tangential = plan/SQRT((1.\\\_dp+G2H2)**3)
+profile = 2._dp*(D*G2 + E*H2 + F*G*H)/(G2H2*r)
+normal = prof/SQRT(1._dp+G2H2)
+```
+
+# Citations

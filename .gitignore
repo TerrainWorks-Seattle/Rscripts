@@ -28,3 +28,9 @@ postMortem/DEM_alignment_files/libs/quarto-html/
 postMortem/images/
 
 *.Rproj
+
+CanFor/.Rhistory
+
+Derivatives/derivatives.pdf
+
+Derivatives/images/circle.PNG
